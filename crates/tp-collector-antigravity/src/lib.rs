@@ -1,0 +1,198 @@
+//! # tp-collector-antigravity
+//!
+//! Antigravity 数据采集组件 — 扫描 `~/.gemini/antigravity/brain/` 目录，
+//! 解析 JSONL/JSON 会话日志，生成 Datalog 记录。
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use tracing::debug;
+
+use tp_protocol::{
+    CollectionError, Datalog, DatasourceProvider, ReportClass, SourceName, TokenInfo,
+};
+
+/// 模型占位符映射表
+fn resolve_model_placeholder(value: &str) -> Option<&'static str> {
+    match value {
+        "MODEL_PLACEHOLDER_M16" => Some("gemini-3.1-pro-high"),
+        "MODEL_PLACEHOLDER_M133" | "gemini-3-flash-b" | "gemini-3-flash-agent"
+        | "MODEL_PLACEHOLDER_M187" | "MODEL_PLACEHOLDER_M20" => Some("gemini-3.5-flash"),
+        "MODEL_PLACEHOLDER_M37" => Some("gemini-3.1-pro-high"),
+        "MODEL_PLACEHOLDER_M36" => Some("gemini-3.1-pro-low"),
+        "MODEL_PLACEHOLDER_M18" => Some("gemini-3-flash"),
+        "MODEL_PLACEHOLDER_M8" => Some("gemini-3-pro-high"),
+        "MODEL_PLACEHOLDER_M7" => Some("gemini-3-pro-low"),
+        "MODEL_PLACEHOLDER_M26" | "claude-opus-4-6-thinking" => Some("claude-opus-4-6-thinking"),
+        "MODEL_PLACEHOLDER_M35" | "claude-sonnet-4-6-thinking" => Some("claude-sonnet-4-6-thinking"),
+        "MODEL_PLACEHOLDER_M12" => Some("claude-opus-4-5-thinking"),
+        "MODEL_CLAUDE_4_5_SONNET" => Some("claude-sonnet-4-5"),
+        "MODEL_CLAUDE_4_5_SONNET_THINKING" => Some("claude-sonnet-4-5-thinking"),
+        "MODEL_GOOGLE_GEMINI_2_5_FLASH" => Some("gemini-2.5-flash"),
+        "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE" => Some("gemini-2.5-flash-lite"),
+        _ => None,
+    }
+}
+
+fn resolve_model(raw: &str) -> String {
+    resolve_model_placeholder(raw)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// Antigravity 数据采集器
+pub struct AntigravityCollector {
+    session_root: PathBuf,
+}
+
+impl AntigravityCollector {
+    pub fn new(session_root: PathBuf) -> Self {
+        Self {
+            session_root,
+        }
+    }
+
+    pub fn default_session_root() -> PathBuf {
+        dirs::home_dir()
+            .map(|h| h.join(".gemini").join("antigravity"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    fn scan_sessions(&self) -> Result<Vec<Datalog>, CollectionError> {
+        let cache_root = self.session_root.join(".token-monitor").join("rpc-cache").join("v1");
+        if !cache_root.exists() {
+            return Err(CollectionError::SourceUnavailable(format!(
+                "RPC cache directory not found: {}", cache_root.display()
+            )));
+        }
+
+        let mut all_logs = Vec::new();
+        let entries = std::fs::read_dir(&cache_root).map_err(CollectionError::Io)?;
+
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() { continue; }
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            match self.parse_session(&entry.path(), &session_id) {
+                Ok(logs) => {
+                    debug!(session_id = %session_id, count = logs.len(), "解析会话成功");
+                    all_logs.extend(logs);
+                }
+                Err(e) => {
+                    debug!(session_id = %session_id, error = %e, "跳过会话");
+                }
+            }
+        }
+        Ok(all_logs)
+    }
+
+    fn parse_session(&self, session_dir: &Path, session_id: &str) -> Result<Vec<Datalog>, CollectionError> {
+        let mut logs = Vec::new();
+        let usage_path = session_dir.join("usage.jsonl");
+
+        if usage_path.exists() {
+            if let Ok(parsed) = self.parse_jsonl_file(&usage_path, session_id) {
+                logs.extend(parsed);
+            }
+        }
+        Ok(logs)
+    }
+
+    fn parse_jsonl_file(&self, path: &Path, session_id: &str) -> Result<Vec<Datalog>, CollectionError> {
+        let file = std::fs::File::open(path).map_err(CollectionError::Io)?;
+        let reader = BufReader::new(file);
+        let mut logs = Vec::new();
+
+        for line in reader.lines() {
+            let line = match line { Ok(l) => l, Err(_) => continue };
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v, Err(_) => continue,
+            };
+
+            if let Some(datalog) = self.extract_datalog_from_step(&value, session_id) {
+                logs.push(datalog);
+            }
+        }
+        Ok(logs)
+    }
+
+    fn extract_datalog_from_step(&self, value: &Value, session_id: &str) -> Option<Datalog> {
+        let usage = value.get("usage").or_else(|| value.get("token_usage")).unwrap_or(value);
+
+        let input = usage.get("input_tokens")
+            .or_else(|| usage.get("inputTokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        let output = usage.get("output_tokens")
+            .or_else(|| usage.get("outputTokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = usage.get("cache_read_tokens")
+            .or_else(|| usage.get("cacheReadTokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_write = usage.get("cache_creation_tokens")
+            .or_else(|| usage.get("cacheCreationTokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+        let reasoning = usage.get("reasoning_tokens")
+            .or_else(|| usage.get("reasoningTokens"))
+            .or_else(|| usage.get("thinkingOutputTokens"))
+            .and_then(|v| v.as_u64()).unwrap_or(0);
+
+        if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 { return None; }
+
+        let model_raw = usage.get("model").or_else(|| usage.get("modelId"))
+            .or_else(|| usage.get("responseModel"))
+            .and_then(|v| v.as_str()).unwrap_or("unknown");
+        let model = resolve_model(model_raw);
+
+        let timestamp_ms = usage.get("timestamp").or_else(|| usage.get("created_at"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+
+        let datetime = DateTime::from_timestamp_millis(timestamp_ms).unwrap_or_else(Utc::now);
+
+        let report_class = if input > 0 || cache_read > 0 {
+            ReportClass::Official
+        } else {
+            ReportClass::Calculate
+        };
+
+        Some(Datalog {
+            source_name: SourceName::Antigravity,
+            source_api_key: None,
+            source_project: session_id.to_string(),
+            source_model: model,
+            source_datetime: datetime,
+            source_through_time: Duration::from_secs(0),
+            source_parent_project: None,
+            source_report_class: report_class,
+            token_info: TokenInfo { input, output, cache: cache_read + cache_write, resourcing: 0, reasoning },
+        })
+    }
+}
+
+#[async_trait]
+impl DatasourceProvider for AntigravityCollector {
+    fn name(&self) -> SourceName { SourceName::Antigravity }
+    fn description(&self) -> &str { "Antigravity (Gemini VS Code Extension) — 文件系统扫描采集" }
+
+    async fn collect(&self) -> Result<Vec<Datalog>, CollectionError> {
+        let session_root = self.session_root.clone();
+        let collector = AntigravityCollector::new(session_root);
+        tokio::task::spawn_blocking(move || collector.scan_sessions())
+            .await
+            .map_err(|e| CollectionError::Unknown(format!("Task join error: {}", e)))?
+    }
+
+    async fn collect_since(&self, _since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
+        self.collect().await
+    }
+
+    async fn health_check(&self) -> Result<bool, CollectionError> {
+        Ok(self.session_root.join("brain").exists())
+    }
+}

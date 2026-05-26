@@ -1,0 +1,10 @@
+[package]
+name = "tp-compute"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tp-protocol.workspace = true
+serde.workspace = true
+chrono.workspace = true
+tracing.workspace = true

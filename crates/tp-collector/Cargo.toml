@@ -1,0 +1,12 @@
+[package]
+name = "tp-collector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tp-protocol.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
