@@ -65,6 +65,9 @@ pub struct AggregationSnapshot {
     pub record_count: u64,
     /// 按报告类型聚合 (Official / Calculate)
     pub by_report_class: HashMap<ReportClass, TokenInfo>,
+    /// 按天聚合的更详细统计 (含 record_count, cost, message_count)
+    #[serde(default)]
+    pub by_day_stats: BTreeMap<String, tp_protocol::view::DailyStats>,
 }
 
 impl Default for AggregationSnapshot {
@@ -80,6 +83,7 @@ impl Default for AggregationSnapshot {
             by_month: BTreeMap::new(),
             record_count: 0,
             by_report_class: HashMap::new(),
+            by_day_stats: BTreeMap::new(),
         }
     }
 }
@@ -101,6 +105,7 @@ struct AggregationState {
     by_month: BTreeMap<String, TokenInfo>,
     record_count: u64,
     by_report_class: HashMap<ReportClass, TokenInfo>,
+    by_day_stats: BTreeMap<String, tp_protocol::view::DailyStats>,
 }
 
 impl Default for AggregationState {
@@ -116,6 +121,7 @@ impl Default for AggregationState {
             by_month: BTreeMap::new(),
             record_count: 0,
             by_report_class: HashMap::new(),
+            by_day_stats: BTreeMap::new(),
         }
     }
 }
@@ -134,6 +140,7 @@ impl AggregationState {
             by_month: snap.by_month.clone(),
             record_count: snap.record_count,
             by_report_class: snap.by_report_class.clone(),
+            by_day_stats: snap.by_day_stats.clone(),
         }
     }
 
@@ -150,6 +157,7 @@ impl AggregationState {
             by_month: self.by_month.clone(),
             record_count: self.record_count,
             by_report_class: self.by_report_class.clone(),
+            by_day_stats: self.by_day_stats.clone(),
         }
     }
 
@@ -179,6 +187,13 @@ impl AggregationState {
         }
         for (rc, info) in &other.by_report_class {
             self.by_report_class.entry(*rc).or_default().accumulate(info);
+        }
+        for (key, stats) in &other.by_day_stats {
+            let entry = self.by_day_stats.entry(key.clone()).or_default();
+            entry.token_info.accumulate(&stats.token_info);
+            entry.record_count += stats.record_count;
+            entry.cost_usd += stats.cost_usd;
+            entry.message_count += stats.message_count;
         }
     }
 }
@@ -257,9 +272,16 @@ impl IncrementalAggregator {
         let day_key = log.date_key();
         self.state
             .by_day
-            .entry(day_key)
+            .entry(day_key.clone())
             .or_default()
             .accumulate(token);
+
+        // 7.5. 按天更详细的统计
+        let day_stats = self.state.by_day_stats.entry(day_key).or_default();
+        day_stats.token_info.accumulate(token);
+        day_stats.record_count += 1;
+        day_stats.cost_usd += cost;
+        day_stats.message_count += 1;
 
         // 8. 按月
         let month_key = log.month_key();
@@ -512,6 +534,7 @@ mod tests {
     ) -> Datalog {
         Datalog {
             source_name: source,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: project.to_string(),
             source_model: model.to_string(),

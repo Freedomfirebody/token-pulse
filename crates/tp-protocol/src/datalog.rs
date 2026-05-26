@@ -117,6 +117,11 @@ impl std::ops::AddAssign for TokenInfo {
     }
 }
 
+/// 获取默认的采集时间 (当前时间)
+pub fn default_collected_at() -> DateTime<Utc> {
+    Utc::now()
+}
+
 /// 统一数据记录 — 系统中所有 token 使用数据的标准表示
 ///
 /// 从架构图:
@@ -129,10 +134,15 @@ impl std::ops::AddAssign for TokenInfo {
 /// - source-parent-project — 父级项目标签（理论上作为子Agent的）
 /// - source-report-class — 报告数据模式 (calculate/official)
 /// - tokenInfo: input/output/cache/resourcing/reasoning
+/// - collected_at: 系统采集数据的时间点 (系统时间，供未来统计/审计使用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Datalog {
     /// 数据来源标识 (Antigravity / Codex / CloudeCode)
     pub source_name: SourceName,
+
+    /// 采集数据的时间点 (系统时间，默认为当前时间)
+    #[serde(default = "default_collected_at", with = "chrono::serde::ts_milliseconds")]
+    pub collected_at: DateTime<Utc>,
 
     /// API Key 级别的标签 (部分工具没有用该配置)
     #[serde(default)]
@@ -256,6 +266,7 @@ mod tests {
     fn test_datalog_uid() {
         let log = Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "session-001".to_string(),
             source_model: "gemini-3.5-flash".to_string(),
@@ -274,6 +285,7 @@ mod tests {
     fn test_datalog_time_keys() {
         let log = Datalog {
             source_name: SourceName::Codex,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "test".to_string(),
             source_model: "gpt-4o".to_string(),

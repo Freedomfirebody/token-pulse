@@ -132,6 +132,8 @@ pub struct CacheProgress {
     pub building: bool,
     /// 上次完成构建的时间
     pub last_build_at: Option<DateTime<Utc>>,
+    /// 中止节点 (截止的小时 key)
+    pub termination_hour_key: Option<String>,
 }
 
 // ===== 数据展示 Trait =====

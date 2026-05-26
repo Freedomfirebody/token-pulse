@@ -23,6 +23,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
     vec![
         Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "session-ag-001".to_string(),
             source_model: "gemini-3.5-flash".to_string(),
@@ -40,6 +41,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
         },
         Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "session-ag-002".to_string(),
             source_model: "gemini-3.1-pro-high".to_string(),
@@ -57,6 +59,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
         },
         Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "session-ag-003".to_string(),
             source_model: "gemini-3.5-flash".to_string(),
@@ -83,6 +86,7 @@ fn mock_codex_data() -> Vec<Datalog> {
     vec![
         Datalog {
             source_name: SourceName::Codex,
+            collected_at: Utc::now(),
             source_api_key: Some("sk-proj-xxx".to_string()),
             source_project: "codex-session-001".to_string(),
             source_model: "o3".to_string(),
@@ -100,6 +104,7 @@ fn mock_codex_data() -> Vec<Datalog> {
         },
         Datalog {
             source_name: SourceName::Codex,
+            collected_at: Utc::now(),
             source_api_key: Some("sk-proj-xxx".to_string()),
             source_project: "codex-session-002".to_string(),
             source_model: "gpt-4.1".to_string(),
@@ -126,6 +131,7 @@ fn mock_claude_data() -> Vec<Datalog> {
     vec![
         Datalog {
             source_name: SourceName::CloudeCode,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "claude-task-001".to_string(),
             source_model: "claude-sonnet-4-5".to_string(),
@@ -151,6 +157,7 @@ fn mock_historical_data_yesterday() -> Vec<Datalog> {
     vec![
         Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "historical-session-001".to_string(),
             source_model: "gemini-3.5-flash".to_string(),
@@ -181,6 +188,7 @@ fn mock_historical_data_last_month() -> Vec<Datalog> {
     vec![
         Datalog {
             source_name: SourceName::Codex,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: "old-codex-session".to_string(),
             source_model: "gpt-4.1".to_string(),
@@ -247,10 +255,10 @@ async fn test_full_pipeline_mock_datasources() {
     cache.build().await.unwrap();
     println!("✅ Cache built successfully");
 
-    // 8. 验证 Cache 快照
+    // 8. 验证 Cache 快照 (根据架构设计，Cache 仅包含已归档的冷数据，故对纯 Active 的热数据应该为 0)
     let snapshot = cache.get_snapshot().await.unwrap();
-    assert!(snapshot.total_tokens.total() > 0, "Cache snapshot should have token data");
-    println!("✅ Cache snapshot: total_tokens={}", snapshot.total_tokens.total());
+    assert_eq!(snapshot.total_tokens.total(), 0, "Cache snapshot should be 0 for purely active hot data");
+    println!("✅ Cache snapshot correctly empty for purely active data: total_tokens={}", snapshot.total_tokens.total());
 
     // 9. 初始化 Aggregator
     let aggregator = Arc::new(tp_aggregator::DataShow::new(
@@ -295,11 +303,12 @@ async fn test_historical_data_triggers_cache_rebuild() {
     pool_storage.push_datalogs(today_data).await.unwrap();
     println!("✅ Today's data pushed");
 
-    // 2. 构建 cache
+    // 2. 构建 cache (此时全是 Active，故 cache 为 0)
     let cache = Arc::new(tp_cache::DataCache::new(pool_storage.clone()));
     cache.build().await.unwrap();
     let initial_snapshot = cache.get_snapshot().await.unwrap();
     let initial_total = initial_snapshot.total_tokens.total();
+    assert_eq!(initial_total, 0);
     println!("✅ Initial cache total: {}", initial_total);
 
     // 3. 推送昨天的历史数据
@@ -307,12 +316,13 @@ async fn test_historical_data_triggers_cache_rebuild() {
     let result = pool_storage.push_datalogs(yesterday_data).await.unwrap();
     println!("✅ Yesterday's data pushed: pushed={}", result.pushed);
 
-    // 4. 通知 cache 并重建
-    let notification = PoolNotification::DataPushed {
-        affected_hour_keys: result.affected_hour_keys.clone(),
-        record_count: result.pushed,
-    };
-    cache.on_pool_notification(notification).await;
+    // 运行归档以将昨日数据从 Active 提升到 ArchiveDaily 归档区，使其能被 cache 识别并计算
+    let archived = pool_storage.run_archive().await.unwrap();
+    assert!(!archived.is_empty(), "Yesterday's data should be archived");
+    println!("✅ Run archive for yesterday's data: archived={:?}", archived);
+
+    // 4. 通知 cache 并重建 (可以直接调用 cache.rebuild() 或 build())
+    cache.rebuild().await.unwrap();
 
     // 5. 验证 cache 包含历史数据
     let updated_snapshot = cache.get_snapshot().await.unwrap();
@@ -324,6 +334,11 @@ async fn test_historical_data_triggers_cache_rebuild() {
     let last_month_data = mock_historical_data_last_month();
     let result = pool_storage.push_datalogs(last_month_data).await.unwrap();
     println!("✅ Last month's data pushed: pushed={}", result.pushed);
+
+    // 再次运行归档，将上个月数据提升到归档区
+    let archived_last_month = pool_storage.run_archive().await.unwrap();
+    assert!(!archived_last_month.is_empty(), "Last month's data should be archived");
+    println!("✅ Run archive for last month's data: archived={:?}", archived_last_month);
 
     // 7. 重建 cache
     cache.rebuild().await.unwrap();
@@ -351,6 +366,7 @@ async fn test_replace_or_push_rules() {
     // Rule 1: Official replaces Calculate
     let calc_log = Datalog {
         source_name: SourceName::Antigravity,
+        collected_at: Utc::now(),
         source_api_key: None,
         source_project: "rop-test".to_string(),
         source_model: "gemini-3.5-flash".to_string(),
@@ -367,6 +383,7 @@ async fn test_replace_or_push_rules() {
     // Push Official with same UID
     let official_log = Datalog {
         source_name: SourceName::Antigravity,
+        collected_at: Utc::now(),
         source_api_key: None,
         source_project: "rop-test".to_string(),
         source_model: "gemini-3.5-flash".to_string(),
@@ -383,6 +400,7 @@ async fn test_replace_or_push_rules() {
     // Rule 3: Calculate should NOT replace Official
     let calc_log2 = Datalog {
         source_name: SourceName::Antigravity,
+        collected_at: Utc::now(),
         source_api_key: None,
         source_project: "rop-test".to_string(),
         source_model: "gemini-3.5-flash".to_string(),

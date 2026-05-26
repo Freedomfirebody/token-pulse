@@ -30,6 +30,14 @@ pub enum DashTab {
     ByProject,
 }
 
+/// 数据管道操作指令
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineCommand {
+    Refresh,
+    Upsert,
+    Rebuild,
+}
+
 #[derive(Clone)]
 pub struct PrecalculatedModelUsage {
     pub name: String,
@@ -61,6 +69,10 @@ pub struct AppState {
     
     // 简易 Model 状态
     pub model_usages: Vec<PrecalculatedModelUsage>,
+
+    // ===== UI Actions Dropdown =====
+    pub dropdown_open: bool,
+    pub command_tx: Option<tokio::sync::mpsc::Sender<PipelineCommand>>,
 }
 
 impl AppState {
@@ -76,7 +88,14 @@ impl AppState {
             sessions_data: SessionTableData::default(),
             collectors_data: Vec::new(),
             model_usages: Vec::new(),
+            dropdown_open: false,
+            command_tx: None,
         }
+    }
+
+    pub fn with_command_tx(mut self, tx: tokio::sync::mpsc::Sender<PipelineCommand>) -> Self {
+        self.command_tx = Some(tx);
+        self
     }
 
     pub fn with_refresh_tx(mut self, tx: tokio::sync::mpsc::Sender<()>) -> Self {
@@ -346,20 +365,25 @@ where
             right_view,
         ))
         .cross_axis_alignment(CrossAxisAlignment::Center),
+        FlexSpacer::Fixed(3.0_f32.px()),
+        sized_box(
+            flex_row((
+                sized_box(label(""))
+                    .height(4.0_f32.px())
+                    .expand_width()
+                    .background_color(theme::TEXT_CYAN)
+                    .flex(fill_flex),
+                sized_box(label(""))
+                    .height(4.0_f32.px())
+                    .expand_width()
+                    .background_color(theme::BG_INPUT)
+                    .flex(empty_flex),
+            ))
+            .gap(0.0_f32.px())
+        )
+        .expand_width()
+        .corner_radius(2.0),
         FlexSpacer::Fixed(6.0_f32.px()),
-        flex_row((
-            sized_box(label(""))
-                .height(6.0_f32.px())
-                .background_color(theme::TEXT_CYAN)
-                .corner_radius(3.0)
-                .flex(fill_flex),
-            sized_box(label(""))
-                .height(6.0_f32.px())
-                .background_color(theme::BG_INPUT)
-                .corner_radius(3.0)
-                .flex(empty_flex),
-        )),
-        FlexSpacer::Fixed(12.0_f32.px()),
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill)
 }
@@ -463,33 +487,106 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     // ===== Decoupled Session Table Module Component =====
     let session_table = session_table_view(state.sessions_data.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
 
+    let termination_str = if let Some(ref key) = view.cache_termination_key {
+        format!(" • Cache boundary: {}", key)
+    } else {
+        "".to_string()
+    };
+
     // ===== Footer =====
     let footer_text = format!(
-        "Last updated: {} • {} total records",
+        "Last updated: {} • {} total records{}",
         view.last_updated.format("%Y-%m-%d %H:%M:%S UTC"),
-        theme::format_with_commas(view.record_count)
+        theme::format_with_commas(view.record_count),
+        termination_str
     );
 
     // ===== Assemble Full Layout (Grid composition) =====
     let main_content = flex_col((
         // Header Bar
         flex_row((
-            label("ANTIGRAVITY TOKEN MONITOR")
-                .text_size(theme::FONT_SIZE_TITLE)
-                .color(theme::TEXT_CYAN),
-            FlexSpacer::Fixed(10.0_f32.px()),
-            // Glowing status dot
-            sized_box(label(""))
-                .width(8.0_f32.px())
-                .height(8.0_f32.px())
-                .background_color(theme::COLOR_SUCCESS)
-                .corner_radius(4.0),
+            flex_row((
+                label("ANTIGRAVITY TOKEN MONITOR")
+                    .text_size(theme::FONT_SIZE_TITLE)
+                    .color(theme::TEXT_CYAN),
+                FlexSpacer::Fixed(10.0_f32.px()),
+                // Glowing status dot
+                sized_box(label(""))
+                    .width(8.0_f32.px())
+                    .height(8.0_f32.px())
+                    .background_color(theme::COLOR_SUCCESS)
+                    .corner_radius(4.0),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Center),
             FlexSpacer::Flex(1.0),
-            label(footer_text)
-                .text_size(theme::FONT_SIZE_SMALL)
-                .color(theme::TEXT_MUTED),
+            flex_col((
+                label(footer_text)
+                    .text_size(theme::FONT_SIZE_SMALL)
+                    .color(theme::TEXT_MUTED),
+                FlexSpacer::Fixed(6.0_f32.px()),
+                {
+                    let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
+                        state.dropdown_open = false;
+                        if let Some(ref tx) = state.command_tx {
+                            let _ = tx.try_send(PipelineCommand::Refresh);
+                        }
+                    });
+
+                    let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
+                        state.dropdown_open = !state.dropdown_open;
+                    });
+
+                    let split_button = sized_box(
+                        flex_row((
+                            refresh_btn,
+                            label("│").color(theme::TEXT_MUTED),
+                            arrow_btn,
+                        ))
+                        .cross_axis_alignment(CrossAxisAlignment::Center)
+                    )
+                    .background_color(theme::BG_INPUT)
+                    .corner_radius(4.0)
+                    .padding(2.0);
+
+                    let dropdown_panel = state.dropdown_open.then(|| {
+                        let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
+                            state.dropdown_open = false;
+                            if let Some(ref tx) = state.command_tx {
+                                let _ = tx.try_send(PipelineCommand::Upsert);
+                            }
+                        });
+
+                        let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
+                            state.dropdown_open = false;
+                            if let Some(ref tx) = state.command_tx {
+                                let _ = tx.try_send(PipelineCommand::Rebuild);
+                            }
+                        });
+
+                        sized_box(
+                            flex_col((
+                                upsert_btn,
+                                FlexSpacer::Fixed(6.0_f32.px()),
+                                rebuild_btn,
+                            ))
+                            .cross_axis_alignment(CrossAxisAlignment::Fill)
+                        )
+                        .width(110.0_f32.px())
+                        .background_color(theme::BG_CARD)
+                        .padding(10.0)
+                        .corner_radius(6.0)
+                    });
+
+                    flex_col((
+                        split_button,
+                        state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
+                        dropdown_panel,
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::End)
+                }
+            )).cross_axis_alignment(CrossAxisAlignment::End),
         ))
-        .cross_axis_alignment(CrossAxisAlignment::Center),
+        .cross_axis_alignment(CrossAxisAlignment::Start),
 
         FlexSpacer::Fixed(16.0_f32.px()),
 

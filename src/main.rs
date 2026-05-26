@@ -72,12 +72,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ===== 4. 在 Runtime 中初始化后台管道 =====
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (view_tx, view_rx) = watch::channel(tp_protocol::view::DashboardView::default());
+    let (cmd_tx, cmd_rx) = mpsc::channel::<tp_dash::PipelineCommand>(32);
+    let (collector_cmd_tx, _) = tokio::sync::broadcast::channel::<tp_collector::CollectorCommand>(16);
 
     let data_dir_clone = data_dir.clone();
     let shutdown_rx_clone = shutdown_rx.clone();
+    let collector_cmd_tx_clone = collector_cmd_tx.clone();
 
     runtime.spawn(async move {
-        if let Err(e) = run_pipeline(data_dir_clone, view_tx, shutdown_rx_clone).await {
+        if let Err(e) = run_pipeline(data_dir_clone, view_tx, cmd_rx, collector_cmd_tx_clone, shutdown_rx_clone).await {
             error!(error = %e, "管道启动失败");
         }
     });
@@ -85,7 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ===== 5. 启动 Xilem UI (主线程) =====
     info!("启动 Xilem 渲染引擎");
 
-    let app_state = tp_dash::AppState::new().with_view_rx(view_rx);
+    let app_state = tp_dash::AppState::new()
+        .with_view_rx(view_rx)
+        .with_command_tx(cmd_tx);
 
     // 启动诊断
     run_startup_diagnostics(&data_dir);
@@ -124,6 +129,8 @@ fn resolve_data_dir() -> PathBuf {
 async fn run_pipeline(
     data_dir: PathBuf,
     view_tx: watch::Sender<tp_protocol::view::DashboardView>,
+    mut cmd_rx: mpsc::Receiver<tp_dash::PipelineCommand>,
+    collector_cmd_tx: tokio::sync::broadcast::Sender<tp_collector::CollectorCommand>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("初始化数据管道...");
@@ -269,10 +276,48 @@ async fn run_pipeline(
         }
     });
 
+    // ===== 监听 UI 管道控制指令 =====
+    let pool_for_cmd = pool.clone();
+    let cache_for_cmd = cache.clone();
+    let aggregator_for_cmd = aggregator.clone();
+    let collector_cmd_tx_for_cmd = collector_cmd_tx.clone();
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            info!("收到管道控制指令: {:?}", cmd);
+            match cmd {
+                tp_dash::PipelineCommand::Refresh => {
+                    info!("执行展示数据 Refresh (重新预计算并渲染)...");
+                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
+                        error!("Refresh 失败: {:?}", e);
+                    }
+                }
+                tp_dash::PipelineCommand::Upsert => {
+                    info!("执行展示数据 Upsert (采集截止点重置为0，强制从头拉取)...");
+                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerUpsert);
+                }
+                tp_dash::PipelineCommand::Rebuild => {
+                    info!("执行全系统 Rebuild (清空存储、清空缓存、采集点归零并重新拉取)...");
+                    // 1. 清空 pool 物理存储
+                    if let Err(e) = pool_for_cmd.clear_storage() {
+                        error!("清空存储失败: {:?}", e);
+                    }
+                    // 2. 清空 cache 内存状态
+                    cache_for_cmd.clear();
+                    // 3. 广播重置采集器并从 0 强制拉取
+                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerRebuild);
+                    // 4. 立即刷新展示 (将重置为全空状态)
+                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
+                        error!("Refresh 失败: {:?}", e);
+                    }
+                }
+            }
+        }
+    });
+
     // ===== 启动流式采集 (每个数据源独立并行) =====
     let collect_interval = Duration::from_secs(60); // 每分钟采集一次
     tokio::spawn(async move {
-        coordinator.run_streaming(collect_interval, shutdown_rx).await;
+        coordinator.run_streaming(collect_interval, collector_cmd_tx, shutdown_rx).await;
     });
 
     info!("数据管道启动完成");

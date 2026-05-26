@@ -95,6 +95,8 @@ pub struct DashboardView {
     pub last_updated: DateTime<Utc>,
     /// 各数据源状态
     pub source_status: Vec<SourceStatus>,
+    /// 缓存的中止节点 (截止的小时 key)
+    pub cache_termination_key: Option<String>,
 }
 
 /// 每日统计
@@ -156,6 +158,7 @@ impl Default for DashboardView {
             recent_records: Vec::new(),
             last_updated: Utc::now(),
             source_status: Vec::new(),
+            cache_termination_key: None,
         }
     }
 }

@@ -62,7 +62,7 @@ impl AntigravityCollector {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    fn scan_sessions(&self) -> Result<Vec<Datalog>, CollectionError> {
+    fn scan_sessions(&self, since: Option<DateTime<Utc>>) -> Result<Vec<Datalog>, CollectionError> {
         let cache_root = self.session_root.join(".token-monitor").join("rpc-cache").join("v1");
         if !cache_root.exists() {
             return Err(CollectionError::SourceUnavailable(format!(
@@ -76,10 +76,12 @@ impl AntigravityCollector {
         for entry in entries.flatten() {
             if !entry.path().is_dir() { continue; }
             let session_id = entry.file_name().to_string_lossy().to_string();
-            match self.parse_session(&entry.path(), &session_id) {
+            match self.parse_session(&entry.path(), &session_id, since) {
                 Ok(logs) => {
-                    debug!(session_id = %session_id, count = logs.len(), "解析会话成功");
-                    all_logs.extend(logs);
+                    if !logs.is_empty() {
+                        debug!(session_id = %session_id, count = logs.len(), "解析会话成功");
+                        all_logs.extend(logs);
+                    }
                 }
                 Err(e) => {
                     debug!(session_id = %session_id, error = %e, "跳过会话");
@@ -89,19 +91,48 @@ impl AntigravityCollector {
         Ok(all_logs)
     }
 
-    fn parse_session(&self, session_dir: &Path, session_id: &str) -> Result<Vec<Datalog>, CollectionError> {
+    fn parse_session(&self, session_dir: &Path, session_id: &str, since: Option<DateTime<Utc>>) -> Result<Vec<Datalog>, CollectionError> {
         let mut logs = Vec::new();
         let usage_path = session_dir.join("usage.jsonl");
 
         if usage_path.exists() {
-            if let Ok(parsed) = self.parse_jsonl_file(&usage_path, session_id) {
+            let manifest_path = session_dir.join("manifest.json");
+            let mut session_last_modified: Option<i64> = None;
+            if manifest_path.exists() {
+                if let Ok(file) = std::fs::File::open(&manifest_path) {
+                    if let Ok(val) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                        session_last_modified = val.get("server_last_modified_ms")
+                            .or_else(|| val.get("serverLastModifiedMs"))
+                            .and_then(|v| v.as_i64());
+                    }
+                }
+            }
+
+            if session_last_modified.is_none() {
+                if let Ok(meta) = std::fs::metadata(&usage_path) {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                            session_last_modified = Some(dur.as_millis() as i64);
+                        }
+                    }
+                }
+            }
+
+            // 如果设置了增量开始时间 since，且会话最终修改时间早于 since，则可以直接完全跳过此会话文件的解析！
+            if let (Some(mtime_ms), Some(since_dt)) = (session_last_modified, since) {
+                if mtime_ms < since_dt.timestamp_millis() {
+                    return Ok(Vec::new());
+                }
+            }
+
+            if let Ok(parsed) = self.parse_jsonl_file(&usage_path, session_id, session_last_modified, since) {
                 logs.extend(parsed);
             }
         }
         Ok(logs)
     }
 
-    fn parse_jsonl_file(&self, path: &Path, session_id: &str) -> Result<Vec<Datalog>, CollectionError> {
+    fn parse_jsonl_file(&self, path: &Path, session_id: &str, fallback_timestamp_ms: Option<i64>, since: Option<DateTime<Utc>>) -> Result<Vec<Datalog>, CollectionError> {
         let file = std::fs::File::open(path).map_err(CollectionError::Io)?;
         let reader = BufReader::new(file);
         let mut logs = Vec::new();
@@ -115,14 +146,20 @@ impl AntigravityCollector {
                 Ok(v) => v, Err(_) => continue,
             };
 
-            if let Some(datalog) = self.extract_datalog_from_step(&value, session_id) {
+            if let Some(datalog) = self.extract_datalog_from_step(&value, session_id, fallback_timestamp_ms) {
+                // 行级增量时间过滤
+                if let Some(since_dt) = since {
+                    if datalog.source_datetime < since_dt {
+                        continue;
+                    }
+                }
                 logs.push(datalog);
             }
         }
         Ok(logs)
     }
 
-    fn extract_datalog_from_step(&self, value: &Value, session_id: &str) -> Option<Datalog> {
+    fn extract_datalog_from_step(&self, value: &Value, session_id: &str, fallback_timestamp_ms: Option<i64>) -> Option<Datalog> {
         let usage = value.get("usage").or_else(|| value.get("token_usage")).unwrap_or(value);
 
         let input = usage.get("input_tokens")
@@ -149,9 +186,45 @@ impl AntigravityCollector {
             .and_then(|v| v.as_str()).unwrap_or("unknown");
         let model = resolve_model(model_raw);
 
-        let timestamp_ms = usage.get("timestamp").or_else(|| usage.get("created_at"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        // 提取并解析真实的时间戳或使用 fallback，配合 sequence 产生唯一的毫秒级偏移以避免去重覆盖
+        let mut ts = None;
+        let ts_paths = [
+            value.get("timestamp"),
+            value.get("created_at"),
+            value.get("createdAt"),
+            usage.get("timestamp"),
+            usage.get("created_at"),
+            usage.get("createdAt"),
+            value.get("raw").and_then(|r| r.get("chatModel")).and_then(|c| c.get("chatStartMetadata")).and_then(|m| m.get("createdAt")),
+            value.get("raw").and_then(|r| r.get("chatModel")).and_then(|c| c.get("createdAt")),
+            value.get("raw").and_then(|r| r.get("createdAt")),
+        ];
+
+        for val in ts_paths.into_iter().flatten() {
+            if val.is_null() { continue; }
+            if let Some(n) = val.as_i64() {
+                ts = Some(n);
+                break;
+            }
+            if let Some(s) = val.as_str() {
+                if let Ok(n) = s.parse::<i64>() {
+                    ts = Some(n);
+                    break;
+                }
+                if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                    ts = Some(dt.timestamp_millis());
+                    break;
+                }
+                if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3fZ") {
+                    ts = Some(dt.timestamp_millis());
+                    break;
+                }
+            }
+        }
+
+        let base_ts = ts.or(fallback_timestamp_ms).unwrap_or_else(|| Utc::now().timestamp_millis());
+        let sequence = value.get("sequence").and_then(|v| v.as_i64()).unwrap_or(0);
+        let timestamp_ms = base_ts + sequence * 1000;
 
         let datetime = DateTime::from_timestamp_millis(timestamp_ms).unwrap_or_else(Utc::now);
 
@@ -163,6 +236,7 @@ impl AntigravityCollector {
 
         Some(Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: session_id.to_string(),
             source_model: model,
@@ -183,13 +257,17 @@ impl DatasourceProvider for AntigravityCollector {
     async fn collect(&self) -> Result<Vec<Datalog>, CollectionError> {
         let session_root = self.session_root.clone();
         let collector = AntigravityCollector::new(session_root);
-        tokio::task::spawn_blocking(move || collector.scan_sessions())
+        tokio::task::spawn_blocking(move || collector.scan_sessions(None))
             .await
             .map_err(|e| CollectionError::Unknown(format!("Task join error: {}", e)))?
     }
 
-    async fn collect_since(&self, _since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
-        self.collect().await
+    async fn collect_since(&self, since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
+        let session_root = self.session_root.clone();
+        let collector = AntigravityCollector::new(session_root);
+        tokio::task::spawn_blocking(move || collector.scan_sessions(Some(since)))
+            .await
+            .map_err(|e| CollectionError::Unknown(format!("Task join error: {}", e)))?
     }
 
     async fn health_check(&self) -> Result<bool, CollectionError> {

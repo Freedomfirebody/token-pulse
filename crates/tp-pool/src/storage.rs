@@ -196,7 +196,22 @@ impl PoolStorage for DataPool {
 
     /// 查询当天活跃数据
     async fn query_active(&self) -> Result<Vec<Datalog>, PoolError> {
-        self.active.read_today()
+        let active_keys: Vec<String> = {
+            let meta = self.metadata.read();
+            meta.metadata()
+                .indices
+                .iter()
+                .filter(|(_, idx)| idx.tier == PartitionTier::Active)
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+
+        let mut all_logs = Vec::new();
+        for key in active_keys {
+            let logs = self.active.read_hour(&key)?;
+            all_logs.extend(logs);
+        }
+        Ok(all_logs)
     }
 
     /// 查询指定时间范围的数据
@@ -207,7 +222,6 @@ impl PoolStorage for DataPool {
     ) -> Result<Vec<Datalog>, PoolError> {
         let from_date = from.format("%Y-%m-%d").to_string();
         let to_date = to.format("%Y-%m-%d").to_string();
-        let today = Utc::now().format("%Y-%m-%d").to_string();
 
         let mut all_logs = Vec::new();
 
@@ -215,11 +229,22 @@ impl PoolStorage for DataPool {
         let archive_logs = self.archive.read_range(&from_date, &to_date)?;
         all_logs.extend(archive_logs);
 
-        // 2. 如果范围包含今天，从活跃区读取
-        if to_date >= today {
-            let active_logs = self.active.read_today()?;
-            // 过滤出范围内的记录
-            let filtered: Vec<_> = active_logs
+        // 2. 从活跃区读取 [from_date, to_date] 范围内的所有 active 小时分片
+        let active_keys: Vec<String> = {
+            let meta = self.metadata.read();
+            meta.metadata()
+                .indices
+                .iter()
+                .filter(|(key, idx)| {
+                    idx.tier == PartitionTier::Active && *key >= &from_date && *key <= &to_date
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+
+        for key in active_keys {
+            let hour_logs = self.active.read_hour(&key)?;
+            let filtered: Vec<_> = hour_logs
                 .into_iter()
                 .filter(|log| log.source_datetime >= from && log.source_datetime <= to)
                 .collect();
@@ -421,6 +446,32 @@ impl PoolStorage for DataPool {
 }
 
 impl DataPool {
+    /// 清空所有数据池存储 (支持 Rebuild 动作)
+    pub fn clear_storage(&self) -> Result<(), PoolError> {
+        let active_path = self.base_path.join("active");
+        let archive_path = self.base_path.join("archive");
+        let _ = std::fs::remove_dir_all(active_path);
+        let _ = std::fs::remove_dir_all(archive_path);
+
+        // 重置并保存空白元数据
+        {
+            let mut meta = self.metadata.write();
+            *meta.metadata_mut() = tp_protocol::PoolMetadata::default();
+            meta.save()?;
+        }
+
+        // 重置并保存空白 replace engine 注册表
+        {
+            let mut engine = self.replace_engine.write();
+            *engine = crate::replace::ReplaceOrPush::new();
+            let registry_path = self.base_path.join(REGISTRY_FILE);
+            engine.save(&registry_path)?;
+        }
+
+        tracing::info!("数据池存储已完全清空");
+        Ok(())
+    }
+
     /// 替换指定小时分片中匹配 UID 的记录
     ///
     /// 读取该小时的所有记录，找到匹配的 UID 并替换，再整体写回。

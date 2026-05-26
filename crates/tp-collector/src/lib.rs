@@ -18,6 +18,12 @@ use tp_protocol::{
     CollectionReport, Datalog, DatasourceProvider, SourceName,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub enum CollectorCommand {
+    TriggerUpsert,
+    TriggerRebuild,
+}
+
 /// 采集协调器
 ///
 /// 管理多个数据源，统一调度采集任务。
@@ -70,19 +76,17 @@ impl CollectorCoordinator {
 
     /// 启动流式采集 — 每个数据源作为独立任务并行运行
     ///
-    /// 与串行 `collect_once` 不同，各数据源不再串行等待，
-    /// 而是各自独立定时、独立推送，**采到即推**。
-    ///
-    /// 消费 self，生命周期与采集循环绑定。
+    /// 与串行 `collect_once` 不同，各数据源定时拉取，并支持通过 broadcast 信道接收控制命令。
     pub async fn run_streaming(
         self,
         interval: Duration,
+        command_tx: tokio::sync::broadcast::Sender<CollectorCommand>,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         info!(
             interval_secs = interval.as_secs(),
             sources = self.sources.len(),
-            "启动流式采集 — 每个数据源独立运行"
+            "启动流式采集 — 每个数据源独立运行 (已加入广播控制信道)"
         );
 
         let mut handles = Vec::new();
@@ -90,6 +94,7 @@ impl CollectorCoordinator {
         for source in self.sources {
             let tx = self.output_tx.clone();
             let mut shutdown = shutdown_rx.clone();
+            let mut cmd_rx = command_tx.subscribe();
 
             handles.push(tokio::spawn(async move {
                 let source_name = source.name();
@@ -102,6 +107,17 @@ impl CollectorCoordinator {
                     tokio::select! {
                         _ = tokio::time::sleep(interval) => {
                             let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                        }
+                        cmd = cmd_rx.recv() => {
+                            if let Ok(command) = cmd {
+                                match command {
+                                    CollectorCommand::TriggerUpsert | CollectorCommand::TriggerRebuild => {
+                                        tracing::info!(source = %source_name, "强制重置拉取被触发 (重置采集截止点为 0)");
+                                        last_collected = None;
+                                        let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                                    }
+                                }
+                            }
                         }
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
@@ -224,6 +240,7 @@ mod tests {
             name,
             data: vec![Datalog {
                 source_name: name,
+                collected_at: Utc::now(),
                 source_api_key: None,
                 source_project: project.to_string(),
                 source_model: "test-model".to_string(),
@@ -279,10 +296,10 @@ mod tests {
         coordinator.register(mock_c.clone());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
+        let (cmd_tx, _cmd_rx) = tokio::sync::broadcast::channel(16);
         // 启动流式采集 (非常短的间隔用于测试)
         let handle = tokio::spawn(async move {
-            coordinator.run_streaming(Duration::from_millis(50), shutdown_rx).await;
+            coordinator.run_streaming(Duration::from_millis(50), cmd_tx, shutdown_rx).await;
         });
 
         // 收集首批数据 (3 个源各自立即采集一次)

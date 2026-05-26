@@ -282,7 +282,17 @@ fn usage_dedupe_hash(message_id: &str, request_id: Option<&str>) -> u64 {
 
 // ==================== 文件内容读取 ====================
 
-fn read_usage_file(path: &Path, loaded: &mut Vec<DailyLoadedEntry>) {
+fn read_usage_file(path: &Path, loaded: &mut Vec<DailyLoadedEntry>, since: Option<DateTime<Utc>>) {
+    if let (Some(since_dt), Ok(meta)) = (since, fs::metadata(path)) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                if (dur.as_millis() as i64) < since_dt.timestamp_millis() {
+                    return;
+                }
+            }
+        }
+    }
+
     let project = extract_project(path);
     let (session_id, project_path) = extract_session_parts(path);
 
@@ -304,6 +314,12 @@ fn read_usage_file(path: &Path, loaded: &mut Vec<DailyLoadedEntry>) {
         if let Ok(entry_line) = serde_json::from_slice::<DailyUsageLine>(&line) {
             let data = entry_line.into_entry();
             if let Some(timestamp) = parse_ts_timestamp(&data.timestamp) {
+                if let Some(since_dt) = since {
+                    if timestamp < since_dt {
+                        line.clear();
+                        continue;
+                    }
+                }
                 loaded.push(DailyLoadedEntry {
                     timestamp,
                     project: project.clone(),
@@ -361,7 +377,7 @@ impl DatasourceProvider for ClaudeCollector {
 
         let mut loaded_entries = Vec::new();
         for file in &files {
-            read_usage_file(file, &mut loaded_entries);
+            read_usage_file(file, &mut loaded_entries, None);
         }
 
         // 基于 Hash 的去重逻辑
@@ -391,6 +407,7 @@ impl DatasourceProvider for ClaudeCollector {
             let model = entry.model.unwrap_or_else(|| "claude-sonnet".to_string());
             datalogs.push(Datalog {
                 source_name: SourceName::CloudeCode,
+                collected_at: Utc::now(),
                 source_api_key: None,
                 source_project: entry.project,
                 source_model: model,
@@ -412,8 +429,65 @@ impl DatasourceProvider for ClaudeCollector {
         Ok(datalogs)
     }
 
-    async fn collect_since(&self, _since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
-        self.collect().await
+    async fn collect_since(&self, since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
+        let paths = claude_paths()?;
+        let mut files = Vec::new();
+        for path in &paths {
+            let projects_dir = path.join("projects");
+            collect_files_with_extension(&projects_dir, "jsonl", &mut files);
+        }
+        files.sort_by_cached_key(|path| path.to_string_lossy().into_owned());
+
+        let mut loaded_entries = Vec::new();
+        for file in &files {
+            read_usage_file(file, &mut loaded_entries, Some(since));
+        }
+
+        // 基于 Hash 的去重逻辑
+        let mut deduped_map: HashMap<u64, DailyLoadedEntry> = HashMap::new();
+        for entry in loaded_entries {
+            if let Some(ref msg_id) = entry.message_id {
+                let request_id = entry.request_id.as_deref();
+                let exact_hash = usage_dedupe_hash(msg_id, request_id);
+
+                if let Some(existing) = deduped_map.get(&exact_hash) {
+                    if should_replace(&entry, existing) {
+                        deduped_map.insert(exact_hash, entry);
+                    }
+                } else {
+                    deduped_map.insert(exact_hash, entry);
+                }
+            } else {
+                let fallback_hash = usage_dedupe_hash(&entry.timestamp.timestamp_millis().to_string(), entry.request_id.as_deref());
+                deduped_map.insert(fallback_hash, entry);
+            }
+        }
+
+        let mut datalogs = Vec::new();
+        for (_, entry) in deduped_map {
+            let model = entry.model.unwrap_or_else(|| "claude-sonnet".to_string());
+            datalogs.push(Datalog {
+                source_name: SourceName::CloudeCode,
+                collected_at: Utc::now(),
+                source_api_key: None,
+                source_project: entry.project,
+                source_model: model,
+                source_datetime: entry.timestamp,
+                source_through_time: Duration::from_secs(0),
+                source_parent_project: Some(entry.session_id),
+                source_report_class: ReportClass::Official,
+                token_info: TokenInfo {
+                    input: entry.usage.input_tokens,
+                    output: entry.usage.output_tokens,
+                    cache: entry.usage.cache_creation_input_tokens + entry.usage.cache_read_input_tokens,
+                    resourcing: 0,
+                    reasoning: 0,
+                },
+            });
+        }
+
+        info!(count = datalogs.len(), "增量 Claude Code 日志扫描及去重成功");
+        Ok(datalogs)
     }
 
     async fn health_check(&self) -> Result<bool, CollectionError> {

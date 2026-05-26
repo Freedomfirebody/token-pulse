@@ -35,52 +35,108 @@ pub struct HeatmapUIState {
     pub hovered_cell: Option<(usize, usize)>,
 }
 
-/// 创建自定义悬浮 Tooltip 视图
+fn format_m_k_tokens(tokens: u64) -> String {
+    if tokens == 0 {
+        "0".to_string()
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// 创建自定义悬浮 Tooltip 视图 (完全贴合图二的 premium 像素级美学设计)
 pub fn build_custom_tooltip<State: 'static>(stats: HeatmapDayStats) -> impl WidgetView<State> {
     let row = |label_str: &str, val_str: &str| {
         flex_row((
-            label(label_str.to_string()).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_SECONDARY),
+            label(label_str.to_string()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY),
             FlexSpacer::Flex(1.0),
-            label(val_str.to_string()).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_PRIMARY),
+            label(val_str.to_string()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
         ))
+    };
+
+    let divider = || {
+        sized_box(label("".to_string()))
+            .height(1.0_f32.px())
+            .background_color(theme::BORDER_SUBTLE)
     };
 
     sized_box(
         flex_col((
-            label(stats.date_str)
-                .text_size(theme::FONT_SIZE_HEADING)
-                .color(theme::TEXT_PRIMARY),
-            FlexSpacer::Fixed(6.0_f32.px()),
-            
-            flex_row((
-                label("Tokens".to_string()).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_SECONDARY),
-                FlexSpacer::Flex(1.0),
-                label(theme::format_with_commas(stats.tokens_processed))
-                    .text_size(theme::FONT_SIZE_HEADING)
-                    .color(theme::TEXT_CYAN),
-            )),
-            FlexSpacer::Fixed(6.0_f32.px()),
-            
-            row("Input", &theme::format_with_commas(stats.input_tokens)),
-            FlexSpacer::Fixed(3.0_f32.px()),
-            row("Output", &theme::format_with_commas(stats.output_tokens)),
-            FlexSpacer::Fixed(3.0_f32.px()),
-            row("Cache", &theme::format_with_commas(stats.cache_tokens)),
-            FlexSpacer::Fixed(3.0_f32.px()),
-            row("Reasoning", &theme::format_with_commas(stats.reasoning_tokens)),
-            
-            FlexSpacer::Fixed(6.0_f32.px()),
-            row("Cost", &format!("${:.4}", stats.cost)),
-            FlexSpacer::Fixed(3.0_f32.px()),
-            row("Messages", &theme::format_with_commas(stats.message_count)),
+            // 块 1：头部与总 Token 汇总
+            flex_col((
+                // 1. 日期头部 (Centered Date)
+                sized_box(
+                    flex_row((
+                        FlexSpacer::Flex(1.0),
+                        label(stats.date_str).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                        FlexSpacer::Flex(1.0),
+                    ))
+                )
+                .expand_width()
+                .padding(xilem::style::Padding::bottom(6.0)),
+                
+                divider(),
+                FlexSpacer::Fixed(8.0_f32.px()),
+                
+                // 2. 总 Token 处理量 (Tokens Processed)
+                flex_row((
+                    label("Tokens Processed".to_string()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY),
+                    FlexSpacer::Flex(1.0),
+                    label(format_m_k_tokens(stats.tokens_processed))
+                        .text_size(16.0_f32)
+                        .color(theme::TEXT_CYAN),
+                )),
+                FlexSpacer::Fixed(8.0_f32.px()),
+                
+                divider(),
+                FlexSpacer::Fixed(8.0_f32.px()),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill),
+
+            // 块 2：详细分类 Token 量
+            flex_col((
+                row("Input", &format_m_k_tokens(stats.input_tokens)),
+                FlexSpacer::Fixed(4.0_f32.px()),
+                row("Output", &format_m_k_tokens(stats.output_tokens)),
+                FlexSpacer::Fixed(4.0_f32.px()),
+                row("Cache Read", &format_m_k_tokens(stats.cache_tokens)),
+                FlexSpacer::Fixed(4.0_f32.px()),
+                row("Cache Write", "0"),
+                FlexSpacer::Fixed(4.0_f32.px()),
+                row("Reasoning", &format_m_k_tokens(stats.reasoning_tokens)),
+                FlexSpacer::Fixed(8.0_f32.px()),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill),
+
+            // 块 3：成本与消息统计
+            flex_col((
+                divider(),
+                FlexSpacer::Fixed(8.0_f32.px()),
+                
+                // 4. 成本与消息统计 (Cost / Messages)
+                flex_row((
+                    label("Cost".to_string()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY),
+                    FlexSpacer::Flex(1.0),
+                    label(format!("${:.2}", stats.cost)).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                )),
+                FlexSpacer::Fixed(4.0_f32.px()),
+                flex_row((
+                    label("Messages".to_string()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY),
+                    FlexSpacer::Flex(1.0),
+                    label(theme::format_with_commas(stats.message_count)).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                )),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill),
         ))
         .cross_axis_alignment(CrossAxisAlignment::Fill)
-        .padding(10.0)
     )
-    .width(200.0_f32.px())
-    .background_color(theme::BG_HOVER)
+    .width(220.0_f32.px())
+    .background_color(theme::BG_PANEL)
     .corner_radius(theme::CARD_CORNER_RADIUS)
-    .padding(2.0)
+    .padding(12.0)
 }
 
 /// 渲染 7x28 带月份标题的悬浮日历热力图

@@ -130,6 +130,7 @@ mod tests {
     fn make_datalog(project: &str, class: ReportClass) -> Datalog {
         Datalog {
             source_name: SourceName::Antigravity,
+            collected_at: chrono::Utc::now(),
             source_api_key: None,
             source_project: project.to_string(),
             source_model: "gemini-3.5-flash".to_string(),

@@ -21,7 +21,7 @@ use tp_compute::IncrementalAggregator;
 use tp_protocol::dimension::{Dimension, TimeWindow};
 use tp_protocol::traits::{CacheProgress, CacheUpdateSignal, PoolNotification};
 use tp_protocol::view::{DashboardView, DimensionEntry};
-use tp_protocol::{CacheError, CacheProvider, PoolStorage};
+use tp_protocol::{CacheError, CacheProvider, PoolStorage, TokenInfo};
 
 // ---------------------------------------------------------------------------
 // DataCache — 核心缓存结构
@@ -63,6 +63,15 @@ impl DataCache {
             metadata_version: AtomicU64::new(0),
             processed_keys: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// 清除所有缓存数据
+    pub fn clear(&self) {
+        self.aggregator.write().reset();
+        self.processed_keys.write().clear();
+        let mut progress = self.progress.write();
+        *progress = CacheProgress::default();
+        self.metadata_version.store(0, Ordering::SeqCst);
     }
 
     /// 全量构建 — 从 pool 读取所有未处理的 hour_key 数据并聚合。
@@ -127,8 +136,17 @@ impl DataCache {
         let version_before = metadata.version;
         self.metadata_version.store(version_before, Ordering::SeqCst);
 
-        let all_keys: Vec<String> = metadata.indices.keys().cloned().collect();
+        let all_keys: Vec<String> = metadata
+            .indices
+            .iter()
+            .filter(|(_, idx)| {
+                idx.tier == tp_protocol::PartitionTier::ArchiveDaily
+                    || idx.tier == tp_protocol::PartitionTier::ArchiveMonthly
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
         let total_count = all_keys.len();
+        let termination_hour_key = all_keys.iter().max().cloned();
 
         // 重置聚合器和已处理集合 (全量重建)
         {
@@ -141,6 +159,7 @@ impl DataCache {
             let mut progress = self.progress.write();
             progress.total_count = total_count;
             progress.processed_count = 0;
+            progress.termination_hour_key = termination_hour_key;
         }
 
         debug!(total_keys = total_count, "building from pool metadata");
@@ -314,9 +333,19 @@ impl DataCache {
             by_model: agg.project(&Dimension::ByModel),
             by_project: agg.project(&Dimension::ByProject),
 
-            // 时间序列 — 由 data-show 层负责更详细的热力图构建
-            daily_series: std::collections::BTreeMap::new(),
-            hourly_today: std::collections::BTreeMap::new(),
+            // 时间序列
+            daily_series: agg.snapshot().by_day_stats,
+            hourly_today: {
+                let mut hourly_today: std::collections::BTreeMap<String, TokenInfo> = std::collections::BTreeMap::new();
+                let today_prefix = now.format("%Y-%m-%dT").to_string();
+                for (hour_key, info) in &agg.snapshot().by_hour {
+                    if hour_key.starts_with(&today_prefix) {
+                        let hh = &hour_key[11..];
+                        hourly_today.entry(hh.to_string()).or_default().accumulate(info);
+                    }
+                }
+                hourly_today
+            },
 
             // 最近活跃 — 由 data-show 层从 pool hot-data 获取
             recent_records: Vec::new(),
@@ -324,6 +353,7 @@ impl DataCache {
             // 元信息
             last_updated: now,
             source_status: Vec::new(),
+            cache_termination_key: self.progress.read().termination_hour_key.clone(),
         }
     }
 }
@@ -478,6 +508,7 @@ mod tests {
     ) -> Datalog {
         Datalog {
             source_name: source,
+            collected_at: Utc::now(),
             source_api_key: None,
             source_project: project.to_string(),
             source_model: model.to_string(),

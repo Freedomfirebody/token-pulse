@@ -5,9 +5,9 @@ members = [
     "crates/tp-compute",
     "crates/tp-cache",
     "crates/tp-collector",
-    "crates/tp-collector-antigravity",
-    "crates/tp-collector-codex",
-    "crates/tp-collector-claude",
+    "plugins/tp-collector-antigravity",
+    "plugins/tp-collector-codex",
+    "plugins/tp-collector-claude",
     "crates/tp-aggregator",
     "crates/tp-dash",
 ]
@@ -54,9 +54,9 @@ tp-pool = { path = "crates/tp-pool" }
 tp-compute = { path = "crates/tp-compute" }
 tp-cache = { path = "crates/tp-cache" }
 tp-collector = { path = "crates/tp-collector" }
-tp-collector-antigravity = { path = "crates/tp-collector-antigravity" }
-tp-collector-codex = { path = "crates/tp-collector-codex" }
-tp-collector-claude = { path = "crates/tp-collector-claude" }
+tp-collector-antigravity = { path = "plugins/tp-collector-antigravity" }
+tp-collector-codex = { path = "plugins/tp-collector-codex" }
+tp-collector-claude = { path = "plugins/tp-collector-claude" }
 tp-aggregator = { path = "crates/tp-aggregator" }
 tp-dash = { path = "crates/tp-dash" }
 

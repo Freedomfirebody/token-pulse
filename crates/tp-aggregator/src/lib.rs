@@ -271,6 +271,7 @@ impl DataShow {
             recent_records: recent,
             last_updated: now,
             source_status: cached_view.source_status.clone(),
+            cache_termination_key: cached_view.cache_termination_key.clone(),
         })
     }
 

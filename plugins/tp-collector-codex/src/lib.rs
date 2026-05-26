@@ -224,7 +224,18 @@ fn visit_codex_session_file(
     sessions_dir: &Path,
     path: &Path,
     events: &mut Vec<CodexTokenUsageEvent>,
+    since: Option<DateTime<Utc>>,
 ) -> Result<(), String> {
+    if let (Some(since_dt), Ok(meta)) = (since, fs::metadata(path)) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                if (dur.as_millis() as i64) < since_dt.timestamp_millis() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let file = fs::File::open(path).map_err(|e| format!("Open failed: {}", e))?;
     let mut reader = BufReader::with_capacity(128 * 1024, file);
     let mut line = Vec::new();
@@ -300,6 +311,12 @@ fn visit_codex_session_file(
 
                 let timestamp = entry.timestamp.and_then(|v| parse_ts_value(&v)).unwrap_or(fallback_timestamp);
 
+                if let Some(since_dt) = since {
+                    if timestamp < since_dt {
+                        continue;
+                    }
+                }
+
                 events.push(CodexTokenUsageEvent {
                     session_id: session_id.clone(),
                     timestamp,
@@ -349,9 +366,16 @@ fn visit_codex_session_file(
                     current_model = Some(m.clone());
                 }
 
+                let event_ts = timestamp.unwrap_or(fallback_timestamp);
+                if let Some(since_dt) = since {
+                    if event_ts < since_dt {
+                        continue;
+                    }
+                }
+
                 events.push(CodexTokenUsageEvent {
                     session_id: session_id.clone(),
-                    timestamp: timestamp.unwrap_or(fallback_timestamp),
+                    timestamp: event_ts,
                     model: parsed_model.or_else(|| current_model.clone()),
                     input_tokens: raw.input_tokens,
                     cached_input_tokens: raw.cached_input_tokens.min(raw.input_tokens),
@@ -390,7 +414,7 @@ impl DatasourceProvider for CodexCollector {
         for file in &files {
             // 获取父目录的父目录，以计算正确的 session_id 相对前缀
             let parent_dir = file.parent().unwrap_or(file);
-            let _ = visit_codex_session_file(parent_dir, file, &mut raw_events);
+            let _ = visit_codex_session_file(parent_dir, file, &mut raw_events, None);
         }
 
         // 转换并转换为最终的 Datalog
@@ -399,6 +423,7 @@ impl DatasourceProvider for CodexCollector {
             let model = ev.model.unwrap_or_else(|| "gpt-5".to_string());
             datalogs.push(Datalog {
                 source_name: SourceName::Codex,
+                collected_at: Utc::now(),
                 source_api_key: None,
                 source_project: ev.session_id,
                 source_model: model,
@@ -420,9 +445,55 @@ impl DatasourceProvider for CodexCollector {
         Ok(datalogs)
     }
 
-    async fn collect_since(&self, _since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
-        // 由于是增量差分计算，我们需要全量遍历会话来推导每个时刻的 delta
-        self.collect().await
+    async fn collect_since(&self, since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
+        let paths = codex_usage_paths()?;
+        let mut files = Vec::new();
+        for path in &paths {
+            collect_usage_files(path, &mut files);
+        }
+        files.sort_by_cached_key(|path| path.to_string_lossy().into_owned());
+
+        let mut raw_events = Vec::new();
+        for file in &files {
+            if let Ok(metadata) = file.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if DateTime::<Utc>::from(modified) < since {
+                        continue;
+                    }
+                }
+            }
+            let parent_dir = file.parent().unwrap_or(file);
+            let _ = visit_codex_session_file(parent_dir, file, &mut raw_events, Some(since));
+        }
+
+        let mut datalogs = Vec::new();
+        for ev in raw_events {
+            if ev.timestamp < since {
+                continue;
+            }
+            let model = ev.model.unwrap_or_else(|| "gpt-5".to_string());
+            datalogs.push(Datalog {
+                source_name: SourceName::Codex,
+                collected_at: Utc::now(),
+                source_api_key: None,
+                source_project: ev.session_id,
+                source_model: model,
+                source_datetime: ev.timestamp,
+                source_through_time: Duration::from_secs(0),
+                source_parent_project: None,
+                source_report_class: ReportClass::Official,
+                token_info: TokenInfo {
+                    input: ev.input_tokens,
+                    output: ev.output_tokens,
+                    cache: ev.cached_input_tokens,
+                    resourcing: 0,
+                    reasoning: ev.reasoning_output_tokens,
+                },
+            });
+        }
+
+        info!(count = datalogs.len(), "增量 Codex 日志数据采集成功");
+        Ok(datalogs)
     }
 
     async fn health_check(&self) -> Result<bool, CollectionError> {
