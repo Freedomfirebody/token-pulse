@@ -3,9 +3,10 @@
 //! 消费 `DashboardView` → 构建 Xilem 渲染树。
 
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment, MainAxisAlignment};
-use xilem::view::{flex_col, flex_row, label, sized_box, worker_raw, text_button, FlexExt as _, FlexSpacer};
+use xilem::view::{flex_col, flex_row, label, sized_box, worker_raw, text_button, button, FlexExt as _, FlexSpacer};
 use xilem::style::Style;
 use xilem::core::fork;
+use xilem::core::one_of::Either;
 use xilem::WidgetView;
 use chrono::{Datelike, NaiveDate};
 
@@ -21,6 +22,7 @@ use crate::views::breakdown::{TokenBreakdownData, breakdown_view_vertical, break
 use crate::views::session_table::{SessionTableData, SessionRow, session_table_view, calculate_sparkline_heights};
 use crate::views::collector_card::{CollectorCardData, collector_card};
 use crate::widgets::responsive_layout;
+use crate::widgets::{hoverable, popover_stack, PopoverConfig, AnchorPoint, PopoverAlign};
 
 /// 仪表盘标签页
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,12 @@ pub struct AppState {
 
     /// Single column layout mode toggle
     pub single_column: bool,
+
+    // ===== UI Actions Hover states =====
+    pub hovered_refresh: bool,
+    pub hovered_dropdown_btn: bool,
+    pub hovered_upsert: bool,
+    pub hovered_rebuild: bool,
 }
 
 impl AppState {
@@ -112,6 +120,10 @@ impl AppState {
             command_tx: None,
             worker_tx: None,
             single_column: false,
+            hovered_refresh: false,
+            hovered_dropdown_btn: false,
+            hovered_upsert: false,
+            hovered_rebuild: false,
         }
     }
 
@@ -431,6 +443,166 @@ where
     .cross_axis_alignment(CrossAxisAlignment::Fill)
 }
 
+/// 构建行业最高品质、仿 JS (如 shadcn/ui) 高级悬浮特效的操作按钮与下拉浮动面板
+fn build_actions_dropdown(
+    dropdown_open: bool,
+    hovered_refresh: bool,
+    hovered_dropdown_btn: bool,
+    hovered_upsert: bool,
+    hovered_rebuild: bool,
+) -> impl WidgetView<AppState> {
+    // 1. 左半部分：刷新按钮 (高度固定为 28px，宽度固定为 93px，与右半部拼接完美达到 120px 宽度)
+    let refresh_btn = hoverable(
+        sized_box(
+            button(
+                label("Refresh").text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                |state: &mut AppState| {
+                    state.dropdown_open = false;
+                    if let Some(ref tx) = state.command_tx {
+                        let _ = tx.try_send(PipelineCommand::Refresh);
+                    }
+                }
+            )
+            .background_color(if hovered_refresh { theme::BG_HOVER } else { theme::BG_INPUT })
+            .corner_radius(4.0)
+            .padding(xilem::style::Padding::from_vh(5.0, 0.0)) // 固定宽度，无需侧边 padding
+        )
+        .height(28.0_f32.px())
+        .width(93.0_f32.px()),
+        |state: &mut AppState, hovered| {
+            state.hovered_refresh = hovered;
+        }
+    );
+
+    // 2. 右半部分：折叠指示箭头 (高度固定为 28px，宽度固定为 24px)
+    let arrow_btn = hoverable(
+        sized_box(
+            button(
+                sized_box(
+                    label(if dropdown_open { "▲" } else { "▼" }).text_size(10.0).color(theme::TEXT_PRIMARY)
+                )
+                .width(12.0_f32.px())
+                .height(12.0_f32.px()),
+                |state: &mut AppState| {
+                    state.dropdown_open = !state.dropdown_open;
+                }
+            )
+            .background_color(if hovered_dropdown_btn { theme::BG_HOVER } else { theme::BG_INPUT })
+            .corner_radius(4.0)
+            .padding(xilem::style::Padding::from_vh(5.0, 0.0))
+        )
+        .height(28.0_f32.px())
+        .width(24.0_f32.px()),
+        |state: &mut AppState, hovered| {
+            state.hovered_dropdown_btn = hovered;
+        }
+    );
+
+    // 3. 仿 JS 聚焦与交互效果 of 组合分割按钮 (高度 28px，总宽度精确固定为 120px：93 + 1 + 24 + 2)
+    let split_button = sized_box(
+        sized_box(
+            flex_row((
+                refresh_btn,
+                sized_box(label(""))
+                    .width(1.0_f32.px())
+                    .height(18.0_f32.px()) // 居中 18px 划分线
+                    .background_color(theme::BORDER_SUBTLE),
+                arrow_btn,
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Center)
+        )
+        .background_color(theme::BG_INPUT)
+        .corner_radius(4.0)
+    )
+    .width(120.0_f32.px()) // 物理像素精确宽度固定为 120px，与下拉面板宽度完全一致！
+    .background_color(if dropdown_open { theme::BORDER_ACCENT } else { theme::BORDER_SUBTLE })
+    .corner_radius(5.0)
+    .padding(1.0);
+
+    // 4. 下拉浮动面板 (极致精简：仅纯文本 Upsert 和 Rebuild，左对齐，120px 宽度，小巧精致)
+    let dropdown_panel = if dropdown_open {
+        let upsert_item = hoverable(
+            button(
+                flex_row((
+                    label("Upsert").text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                    FlexSpacer::Flex(1.0),
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+                |state: &mut AppState| {
+                    state.dropdown_open = false;
+                    if let Some(ref tx) = state.command_tx {
+                        let _ = tx.try_send(PipelineCommand::Upsert);
+                    }
+                }
+            )
+            .background_color(if hovered_upsert { theme::BG_HOVER } else { theme::BG_PANEL })
+            .corner_radius(4.0)
+            .padding(xilem::style::Padding::from_vh(6.0, 12.0)),
+            |state: &mut AppState, hovered| {
+                state.hovered_upsert = hovered;
+            }
+        );
+
+        let rebuild_item = hoverable(
+            button(
+                flex_row((
+                    label("Rebuild").text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY),
+                    FlexSpacer::Flex(1.0),
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::Center),
+                |state: &mut AppState| {
+                    state.dropdown_open = false;
+                    if let Some(ref tx) = state.command_tx {
+                        let _ = tx.try_send(PipelineCommand::Rebuild);
+                    }
+                }
+            )
+            .background_color(if hovered_rebuild { theme::BG_HOVER } else { theme::BG_PANEL })
+            .corner_radius(4.0)
+            .padding(xilem::style::Padding::from_vh(6.0, 12.0)),
+            |state: &mut AppState, hovered| {
+                state.hovered_rebuild = hovered;
+            }
+        );
+
+        Either::A(
+            sized_box(
+                sized_box(
+                    flex_col((
+                        upsert_item,
+                        FlexSpacer::Fixed(4.0_f32.px()),
+                        rebuild_item,
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Fill)
+                )
+                .background_color(theme::BG_PANEL)
+                .corner_radius(5.0)
+                .padding(4.0)
+            )
+            .width(120.0_f32.px()) // 面板宽度精确固定为 120px
+            .background_color(theme::BORDER_SUBTLE)
+            .corner_radius(6.0)
+            .padding(1.0)
+        )
+    } else {
+        Either::B(
+            sized_box(label("")).width(0.0_f32.px()).height(0.0_f32.px())
+        )
+    };
+
+    // 使用 popover_stack 高级组件进行对齐与层级管理，彻底摆脱写死的 x/y 绝对偏移量，实现 100% 动态等宽垂直对齐！
+    popover_stack(
+        split_button,
+        dropdown_panel,
+        PopoverConfig {
+            anchor_point: AnchorPoint::BottomLeft,
+            popover_align: PopoverAlign::TopLeft,
+            offset_x: 0.0,
+            offset_y: 2.0, // 2px 精美间距
+        }
+    )
+}
+
 /// Xilem 应用主入口 — 根据 AppState 构建视图树
 pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     let view = &state.view;
@@ -448,14 +620,14 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         state.active_tab = DashTab::BySource;
     });
 
-    let tab_bar_single = flex_row((
+    let tab_bar_single = sized_box(flex_row((
         tab_all_single,
         FlexSpacer::Fixed(15.0_f32.px()),
         tab_antigravity_single,
         FlexSpacer::Fixed(15.0_f32.px()),
         tab_codex_single,
         FlexSpacer::Flex(1.0),
-    ));
+    ))).height(36.0_f32.px());
 
     // ===== Tab Buttons for Dual =====
     let tab_all_dual = text_button(if state.active_tab == DashTab::Overview { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
@@ -470,14 +642,14 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         state.active_tab = DashTab::BySource;
     });
 
-    let tab_bar_dual = flex_row((
+    let tab_bar_dual = sized_box(flex_row((
         tab_all_dual,
         FlexSpacer::Fixed(15.0_f32.px()),
         tab_antigravity_dual,
         FlexSpacer::Fixed(15.0_f32.px()),
         tab_codex_dual,
         FlexSpacer::Flex(1.0),
-    ));
+    ))).height(36.0_f32.px());
 
     // ===== KPI Row for Single =====
     let kpi_row_single = flex_row((
@@ -502,8 +674,7 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     ));
 
     // ===== 1. Tooltip Coordinates and hoverable tooltip (Calculated early) =====
-    let mut x_pos = 0.0;
-    let mut y_pos = 0.0;
+    let mut anchor_point = AnchorPoint::TopLeft;
     let mut stats_opt = None;
 
     if let Some((c_idx, r_idx)) = state.heatmap_ui.hovered_cell {
@@ -517,17 +688,17 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                 let cell_gap = 4.0;
 
                 // Inside panel, above first cell: padding (16) + title/subtitle block (40) + month header + spacer = 86px
-                let y_base = 86.0;
+                // Adding the vertical offset of the heatmap card relative to the body content:
+                // Spacer(60) + TabBar(36) + Spacer(16) + KpiRow(105) + Spacer(12) = 229px.
+                // So y_base becomes 229.0 + 86.0 = 315.0px.
+                let y_base = 315.0;
 
                 let x_offset = x_base + (c_idx as f64) * (cell_box_size + cell_gap);
                 let y_offset = y_base + (r_idx as f64) * (cell_box_size + cell_gap);
 
-                // ALWAYS place to the right of the cell (+ cell_box_size + gap) so it attaches to the side like a context menu,
+                // ALWAYS place to the right of the cell (+ cell_box_size) so it attaches to the side like a context menu,
                 // and avoids covering up the calendar grid!
-                x_pos = x_offset + cell_box_size + cell_gap;
-
-                // Premium floating vertical centering relative to the cell
-                y_pos = y_offset + (cell_box_size / 2.0) - 95.0;
+                anchor_point = AnchorPoint::Custom(x_offset + cell_box_size, y_offset + cell_box_size / 2.0);
                 stats_opt = Some(stats.clone());
             }
         }
@@ -590,19 +761,11 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
 
     let heatmap_panel_fixed_single = sized_box(heatmap_panel_single).width(480.0_f32.px());
 
-    let heatmap_with_tooltip_single = crate::widgets::overlay_stack(
-        heatmap_panel_fixed_single,
-        hoverable_tooltip_single,
-        x_pos as f64,
-        y_pos as f64,
-    );
-
     let heatmap_single = flex_row((
-        FlexSpacer::Flex(1.0),
-        heatmap_with_tooltip_single,
+        heatmap_panel_fixed_single,
         FlexSpacer::Flex(1.0),
     ))
-    .main_axis_alignment(MainAxisAlignment::Center);
+    .main_axis_alignment(MainAxisAlignment::Start);
 
     // ===== 3. Dual-column Heatmap view construction =====
     let tooltip_dual = crate::views::heatmap::build_custom_tooltip(stats_opt.clone());
@@ -661,19 +824,11 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
 
     let heatmap_panel_fixed_dual = sized_box(heatmap_panel_dual).width(480.0_f32.px());
 
-    let heatmap_with_tooltip_dual = crate::widgets::overlay_stack(
-        heatmap_panel_fixed_dual,
-        hoverable_tooltip_dual,
-        x_pos as f64,
-        y_pos as f64,
-    );
-
     let heatmap_dual = flex_row((
-        FlexSpacer::Flex(1.0),
-        heatmap_with_tooltip_dual,
+        heatmap_panel_fixed_dual,
         FlexSpacer::Flex(1.0),
     ))
-    .main_axis_alignment(MainAxisAlignment::Center);
+    .main_axis_alignment(MainAxisAlignment::Start);
 
     // ===== 4. Model Usage view constructions =====
     let model_rows_single: Vec<_> = state.model_usages.iter().map(|usage| {
@@ -795,66 +950,13 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                 .text_size(theme::FONT_SIZE_SMALL)
                 .color(theme::TEXT_MUTED),
             FlexSpacer::Fixed(6.0_f32.px()),
-            {
-                let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
-                    state.dropdown_open = false;
-                    if let Some(ref tx) = state.command_tx {
-                        let _ = tx.try_send(PipelineCommand::Refresh);
-                    }
-                });
-
-                let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
-                    state.dropdown_open = !state.dropdown_open;
-                });
-
-                let split_button = sized_box(
-                    flex_row((
-                        refresh_btn,
-                        label("│").color(theme::TEXT_MUTED),
-                        arrow_btn,
-                    ))
-                    .cross_axis_alignment(CrossAxisAlignment::Center)
-                )
-                .background_color(theme::BG_INPUT)
-                .corner_radius(4.0)
-                .padding(2.0);
-
-                let dropdown_panel = state.dropdown_open.then(|| {
-                    let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
-                        state.dropdown_open = false;
-                        if let Some(ref tx) = state.command_tx {
-                            let _ = tx.try_send(PipelineCommand::Upsert);
-                        }
-                    });
-
-                    let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
-                        state.dropdown_open = false;
-                        if let Some(ref tx) = state.command_tx {
-                            let _ = tx.try_send(PipelineCommand::Rebuild);
-                        }
-                    });
-
-                    sized_box(
-                        flex_col((
-                            upsert_btn,
-                            FlexSpacer::Fixed(6.0_f32.px()),
-                            rebuild_btn,
-                        ))
-                        .cross_axis_alignment(CrossAxisAlignment::Fill)
-                    )
-                    .width(110.0_f32.px())
-                    .background_color(theme::BG_CARD)
-                    .padding(10.0)
-                    .corner_radius(6.0)
-                });
-
-                flex_col((
-                    split_button,
-                    state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
-                    dropdown_panel,
-                ))
-                .cross_axis_alignment(CrossAxisAlignment::End)
-            }
+            build_actions_dropdown(
+                state.dropdown_open,
+                state.hovered_refresh,
+                state.hovered_dropdown_btn,
+                state.hovered_upsert,
+                state.hovered_rebuild,
+            )
         )).cross_axis_alignment(CrossAxisAlignment::End),
     ))
     .cross_axis_alignment(CrossAxisAlignment::Start);
@@ -879,74 +981,20 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                 .text_size(theme::FONT_SIZE_SMALL)
                 .color(theme::TEXT_MUTED),
             FlexSpacer::Fixed(6.0_f32.px()),
-            {
-                let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
-                    state.dropdown_open = false;
-                    if let Some(ref tx) = state.command_tx {
-                        let _ = tx.try_send(PipelineCommand::Refresh);
-                    }
-                });
-
-                let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
-                    state.dropdown_open = !state.dropdown_open;
-                });
-
-                let split_button = sized_box(
-                    flex_row((
-                        refresh_btn,
-                        label("│").color(theme::TEXT_MUTED),
-                        arrow_btn,
-                    ))
-                    .cross_axis_alignment(CrossAxisAlignment::Center)
-                )
-                .background_color(theme::BG_INPUT)
-                .corner_radius(4.0)
-                .padding(2.0);
-
-                let dropdown_panel = state.dropdown_open.then(|| {
-                    let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
-                        state.dropdown_open = false;
-                        if let Some(ref tx) = state.command_tx {
-                            let _ = tx.try_send(PipelineCommand::Upsert);
-                        }
-                    });
-
-                    let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
-                        state.dropdown_open = false;
-                        if let Some(ref tx) = state.command_tx {
-                            let _ = tx.try_send(PipelineCommand::Rebuild);
-                        }
-                    });
-
-                    sized_box(
-                        flex_col((
-                            upsert_btn,
-                            FlexSpacer::Fixed(6.0_f32.px()),
-                            rebuild_btn,
-                        ))
-                        .cross_axis_alignment(CrossAxisAlignment::Fill)
-                    )
-                    .width(110.0_f32.px())
-                    .background_color(theme::BG_CARD)
-                    .padding(10.0)
-                    .corner_radius(6.0)
-                });
-
-                flex_col((
-                    split_button,
-                    state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
-                    dropdown_panel,
-                ))
-                .cross_axis_alignment(CrossAxisAlignment::End)
-            }
+            build_actions_dropdown(
+                state.dropdown_open,
+                state.hovered_refresh,
+                state.hovered_dropdown_btn,
+                state.hovered_upsert,
+                state.hovered_rebuild,
+            )
         )).cross_axis_alignment(CrossAxisAlignment::End),
     ))
     .cross_axis_alignment(CrossAxisAlignment::Start);
 
     // ===== 7. Responsive Layout Composition =====
-    let main_content_single = flex_col((
-        header_bar_single,
-        FlexSpacer::Fixed(16.0_f32.px()),
+    let main_content_without_header_single = flex_col((
+        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 高度给绝对定位悬浮的 Header Bar，完美避免重叠
         tab_bar_single,
         FlexSpacer::Fixed(16.0_f32.px()),
         kpi_row_single,
@@ -968,9 +1016,31 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill);
 
-    let main_content_dual = flex_col((
-        header_bar_dual,
-        FlexSpacer::Fixed(16.0_f32.px()),
+    // 将日历热力图弹窗与 Header Bar 悬浮图层进行层级递进（Tooltip在Level 1，Header Dropdown在Level 2），100% 解决层级遮挡问题
+    let main_content_with_tooltip_single = popover_stack(
+        main_content_without_header_single,
+        hoverable_tooltip_single,
+        PopoverConfig {
+            anchor_point,
+            popover_align: PopoverAlign::LeftCenter,
+            offset_x: 4.0, // cell_gap
+            offset_y: 0.0,
+        }
+    );
+
+    let main_content_single = popover_stack(
+        main_content_with_tooltip_single,
+        sized_box(header_bar_single).expand_width(),
+        PopoverConfig {
+            anchor_point: AnchorPoint::TopLeft,
+            popover_align: PopoverAlign::TopLeft,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    );
+
+    let main_content_without_header_dual = flex_col((
+        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 头部空间
         tab_bar_dual,
         FlexSpacer::Fixed(16.0_f32.px()),
         kpi_row_dual,
@@ -996,6 +1066,28 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         session_table_dual,
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill);
+
+    let main_content_with_tooltip_dual = popover_stack(
+        main_content_without_header_dual,
+        hoverable_tooltip_dual,
+        PopoverConfig {
+            anchor_point,
+            popover_align: PopoverAlign::LeftCenter,
+            offset_x: 4.0, // cell_gap
+            offset_y: 0.0,
+        }
+    );
+
+    let main_content_dual = popover_stack(
+        main_content_with_tooltip_dual,
+        sized_box(header_bar_dual).expand_width(),
+        PopoverConfig {
+            anchor_point: AnchorPoint::TopLeft,
+            popover_align: PopoverAlign::TopLeft,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        }
+    );
 
     let main_view = vertical_portal(
         responsive_layout(

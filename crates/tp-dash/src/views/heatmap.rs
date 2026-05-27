@@ -66,7 +66,7 @@ pub fn build_custom_tooltip<State: 'static>(stats_opt: Option<HeatmapDayStats>) 
     };
 
     flex_col(stats_opt.map(|stats| {
-        sized_box(
+        let content_box = sized_box(
             flex_col((
                 // 块 1：头部与总 Token 汇总
                 flex_col((
@@ -140,7 +140,12 @@ pub fn build_custom_tooltip<State: 'static>(stats_opt: Option<HeatmapDayStats>) 
         .height(190.0_f32.px())
         .background_color(theme::BG_CARD)
         .corner_radius(theme::CARD_CORNER_RADIUS)
-        .padding(12.0)
+        .padding(12.0);
+
+        sized_box(content_box)
+            .background_color(theme::BORDER_SUBTLE)
+            .corner_radius(theme::CARD_CORNER_RADIUS + 1.0)
+            .padding(1.0)
     }))
 }
 
