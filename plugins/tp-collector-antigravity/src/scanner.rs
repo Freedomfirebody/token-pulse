@@ -1,11 +1,7 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use sha1::{Sha1, Digest};
-use rayon::prelude::*;
-use sysinfo::System;
 
-use crate::types::{SessionScanCandidate, SessionParsePlan, SessionTotals};
-use crate::parser::AntigravitySessionParser;
+use crate::types::{SessionScanCandidate, SessionParsePlan};
 
 pub struct SessionScanner;
 
@@ -123,58 +119,6 @@ impl SessionScanner {
         println!("[Profiler] scan() completed: gathered {} candidates in {:?}", candidates.len(), scan_start.elapsed());
         Ok(candidates)
     }
-
-    /// Parallel processing engine: Scans and parses all session data using Rayon
-    pub fn scan_and_parse_parallel(&self, session_root: &str) -> Result<Vec<SessionTotals>, String> {
-        let total_start = std::time::Instant::now();
-        let candidates = self.scan(session_root)?;
-        let rpc_cache_dir = Path::new(session_root).join(".token-monitor").join("rpc-cache").join("v1");
-
-        // Convert ScanCandidates into SessionParsePlans
-        let plans: Vec<SessionParsePlan> = candidates.into_iter()
-            .map(|c| {
-                let mut token_file_paths = c.file_paths.clone();
-                let usage_path = rpc_cache_dir.join(&c.session_id).join("usage.jsonl");
-                let steps_path = rpc_cache_dir.join(&c.session_id).join("steps.jsonl");
-                let mut source = "filesystem".to_string();
-
-                if usage_path.exists() {
-                    token_file_paths.push(usage_path.to_string_lossy().to_string());
-                    source = "rpc-artifact".to_string();
-                }
-                if steps_path.exists() {
-                    token_file_paths.push(steps_path.to_string_lossy().to_string());
-                }
-
-                SessionParsePlan {
-                    session_id: c.session_id,
-                    session_dir: c.session_dir,
-                    label_hint: c.label_hint,
-                    last_modified_ms: c.last_modified_ms,
-                    token_file_paths,
-                    analysis_signature: c.signature,
-                    source,
-                }
-            })
-            .collect();
-
-        // PARALLEL COMPUTATION LINE: Process all session files concurrently using Rayon!
-        let parser = AntigravitySessionParser::new();
-        let parsed_sessions: Vec<SessionTotals> = plans.par_iter()
-            .filter_map(|plan| {
-                match parser.parse(plan) {
-                    Ok(totals) => Some(totals),
-                    Err(e) => {
-                        println!("[Scanner] Parallel parsing error on {}: {}", plan.session_id, e);
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        println!("[Profiler] scan_and_parse_parallel() completed: parsed {} sessions in {:?}", parsed_sessions.len(), total_start.elapsed());
-        Ok(parsed_sessions)
-    }
 }
 
 fn collect_files(dir_path: &Path, canonical_root: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -232,24 +176,4 @@ fn collect_files(dir_path: &Path, canonical_root: &Path, files: &mut Vec<PathBuf
     }
 
     Ok(())
-}
-
-/// Natively detects running Agent processes on macOS, Windows, and Linux
-pub fn check_active_processes() -> HashMap<String, u32> {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let mut active = HashMap::new();
-    let process_targets = ["cortex", "gemini", "claude", "antigravity"];
-
-    for (pid, process) in sys.processes() {
-        let name = process.name().to_string_lossy().to_lowercase();
-        for target in &process_targets {
-            if name.contains(target) {
-                active.insert(target.to_string(), pid.as_u32());
-            }
-        }
-    }
-
-    active
 }

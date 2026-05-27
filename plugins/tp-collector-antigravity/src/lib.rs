@@ -3,6 +3,13 @@
 //! Antigravity 数据采集组件 — 扫描 `~/.gemini/antigravity/brain/` 目录，
 //! 解析 JSONL/JSON 会话日志，生成 Datalog 记录。
 
+mod config;
+mod types;
+mod store;
+mod model_aliases;
+mod scanner;
+mod rpc;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +22,7 @@ use tracing::debug;
 use tp_protocol::{
     CollectionError, Datalog, DatasourceProvider, ReportClass, SourceName, TokenInfo,
 };
+
 
 /// 模型占位符映射表
 fn resolve_model_placeholder(value: &str) -> Option<&'static str> {
@@ -61,6 +69,31 @@ impl AntigravityCollector {
             .map(|h| h.join(".gemini").join("antigravity"))
             .unwrap_or_else(|| PathBuf::from("."))
     }
+
+    async fn sync_rpc(&self) -> Result<(), CollectionError> {
+        let session_root = self.session_root.to_string_lossy().to_string();
+        let config = self::store::SettingsStore::new(&session_root).load_config();
+        
+        let scan_res = {
+            let session_root_clone = session_root.clone();
+            tokio::task::spawn_blocking(move || {
+                let scanner = self::scanner::SessionScanner::new();
+                scanner.scan(&session_root_clone)
+            })
+            .await
+            .map_err(|e| CollectionError::Unknown(format!("Task join error during scan: {}", e)))?
+        };
+
+        let candidates = scan_res
+            .map_err(|e| CollectionError::Unknown(format!("Scan failed: {}", e)))?;
+
+        let exporter = self::rpc::TrajectoryExporter::new(config);
+        let _ = exporter.export_changed_sessions(&candidates, false, true)
+            .await
+            .map_err(|e| CollectionError::Unknown(format!("Export failed: {}", e)))?;
+        Ok(())
+    }
+
 
     fn scan_sessions(&self, since: Option<DateTime<Utc>>) -> Result<Vec<Datalog>, CollectionError> {
         let cache_root = self.session_root.join(".token-monitor").join("rpc-cache").join("v1");
@@ -255,6 +288,10 @@ impl DatasourceProvider for AntigravityCollector {
     fn description(&self) -> &str { "Antigravity (Gemini VS Code Extension) — 文件系统扫描采集" }
 
     async fn collect(&self) -> Result<Vec<Datalog>, CollectionError> {
+        if let Err(e) = self.sync_rpc().await {
+            debug!(error = %e, "Antigravity Telemetry RPC sync failed, falling back to cached files");
+        }
+
         let session_root = self.session_root.clone();
         let collector = AntigravityCollector::new(session_root);
         tokio::task::spawn_blocking(move || collector.scan_sessions(None))
@@ -263,6 +300,10 @@ impl DatasourceProvider for AntigravityCollector {
     }
 
     async fn collect_since(&self, since: DateTime<Utc>) -> Result<Vec<Datalog>, CollectionError> {
+        if let Err(e) = self.sync_rpc().await {
+            debug!(error = %e, "Antigravity Telemetry RPC sync failed, falling back to cached files");
+        }
+
         let session_root = self.session_root.clone();
         let collector = AntigravityCollector::new(session_root);
         tokio::task::spawn_blocking(move || collector.scan_sessions(Some(since)))

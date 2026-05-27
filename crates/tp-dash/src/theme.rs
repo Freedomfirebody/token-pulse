@@ -49,11 +49,11 @@ pub const SECTION_GAP: f64 = 12.0;
 pub const CARD_CORNER_RADIUS: f64 = 8.0;
 
 // ===== 字号 =====
-pub const FONT_SIZE_TITLE: f32 = 24.0;
-pub const FONT_SIZE_HEADING: f32 = 14.0;
-pub const FONT_SIZE_BODY: f32 = 12.0;
-pub const FONT_SIZE_SMALL: f32 = 10.0;
-pub const FONT_SIZE_KPI: f32 = 24.0;
+pub const FONT_SIZE_TITLE: f32 = 28.0;
+pub const FONT_SIZE_HEADING: f32 = 18.0;
+pub const FONT_SIZE_BODY: f32 = 14.0;
+pub const FONT_SIZE_SMALL: f32 = 12.0;
+pub const FONT_SIZE_KPI: f32 = 32.0;
 
 /// 根据 token 数量返回热力图颜色
 pub fn heatmap_color(tokens: u64) -> Color {
@@ -64,6 +64,21 @@ pub fn heatmap_color(tokens: u64) -> Color {
     } else if tokens < 10_000 {
         HEATMAP_MED
     } else if tokens < 100_000 {
+        HEATMAP_HIGH
+    } else {
+        HEATMAP_MAX
+    }
+}
+
+/// 根据分位数动态计算热力图颜色 (实现自适应的极高品质视觉呈现)
+pub fn heatmap_color_dynamic(tokens: u64, q25: u64, q50: u64, q75: u64) -> Color {
+    if tokens == 0 {
+        HEATMAP_EMPTY
+    } else if tokens < q25 {
+        HEATMAP_LOW
+    } else if tokens < q50 {
+        HEATMAP_MED
+    } else if tokens < q75 {
         HEATMAP_HIGH
     } else {
         HEATMAP_MAX

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Write, Read};
+use std::io::Read;
 use std::path::PathBuf;
 
 use crate::config::MonitorConfig;
@@ -34,16 +34,5 @@ impl SettingsStore {
         }
 
         MonitorConfig::default()
-    }
-
-    pub fn save_config(&self, config: &MonitorConfig) -> Result<(), std::io::Error> {
-        if let Some(parent) = self.file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let content = serde_json::to_string_pretty(config)?;
-        let mut file = File::create(&self.file_path)?;
-        file.write_all(content.as_bytes())?;
-        Ok(())
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! 消费 `DashboardView` → 构建 Xilem 渲染树。
 
-use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment};
+use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment, MainAxisAlignment};
 use xilem::view::{flex_col, flex_row, label, sized_box, worker_raw, text_button, FlexExt as _, FlexSpacer};
 use xilem::style::Style;
 use xilem::core::fork;
@@ -17,9 +17,10 @@ use crate::widgets::portal::vertical_portal;
 
 // 导入解耦的组件模型与视图
 use crate::views::heatmap::{HeatmapData, HeatmapUIState, HeatmapDayStats, heatmap_view};
-use crate::views::breakdown::{TokenBreakdownData, breakdown_view};
+use crate::views::breakdown::{TokenBreakdownData, breakdown_view_vertical, breakdown_view_horizontal};
 use crate::views::session_table::{SessionTableData, SessionRow, session_table_view, calculate_sparkline_heights};
 use crate::views::collector_card::{CollectorCardData, collector_card};
+use crate::widgets::responsive_layout;
 
 /// 仪表盘标签页
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +50,19 @@ pub struct PrecalculatedModelUsage {
     pub empty_flex: f64,
 }
 
+/// Message sent from main UI thread to background worker
+#[derive(Debug, Clone)]
+pub enum WorkerMessage {
+    ClosePopupDelay,
+}
+
+/// Event sent from background worker to main UI thread
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    ViewUpdate(DashboardView),
+    ClosePopup,
+}
+
 /// 应用状态 — Xilem 的 root state
 pub struct AppState {
     /// 当前显示的仪表盘数据
@@ -73,6 +87,12 @@ pub struct AppState {
     // ===== UI Actions Dropdown =====
     pub dropdown_open: bool,
     pub command_tx: Option<tokio::sync::mpsc::Sender<PipelineCommand>>,
+    
+    /// Background worker message sender
+    pub worker_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkerMessage>>,
+
+    /// Single column layout mode toggle
+    pub single_column: bool,
 }
 
 impl AppState {
@@ -90,6 +110,8 @@ impl AppState {
             model_usages: Vec::new(),
             dropdown_open: false,
             command_tx: None,
+            worker_tx: None,
+            single_column: false,
         }
     }
 
@@ -139,13 +161,13 @@ fn precalculate(state: &mut AppState) {
         }
     }).collect();
 
-    // 2. 投影构建 Heatmap 核心组件数据 (28周 × 7天日历网格)
+    // 2. 投影构建 Heatmap 核心组件数据 (13周 × 7天年度日历网格)
     let now_dt = chrono::Local::now();
     let today = now_dt.date_naive();
     let weekday = today.weekday();
     let days_from_monday = weekday.num_days_from_monday() as i64;
     let current_week_monday = today - chrono::Duration::days(days_from_monday);
-    let grid_start_monday = current_week_monday - chrono::Duration::weeks(27);
+    let grid_start_monday = current_week_monday - chrono::Duration::weeks(12); // 12周前 (共13周，3个月)
 
     let mut stats_by_date: std::collections::HashMap<NaiveDate, tp_protocol::view::DailyStats> = std::collections::HashMap::new();
     for (date_str, stats) in &view.daily_series {
@@ -154,15 +176,36 @@ fn precalculate(state: &mut AppState) {
         }
     }
 
-    state.heatmap_data.weeks = (0..28).map(|c| {
+    // 计算自适应分位数色阶阈值 (25%, 50%, 75% 分位数)
+    let mut non_zero_tokens: Vec<u64> = view.daily_series.values()
+        .map(|s| s.token_info.total())
+        .filter(|&t| t > 0)
+        .collect();
+    non_zero_tokens.sort_unstable();
+
+    let (q25, q50, q75) = if non_zero_tokens.is_empty() {
+        (1_000, 10_000, 100_000) // 默认兜底
+    } else {
+        let len = non_zero_tokens.len();
+        let q25 = non_zero_tokens[len * 25 / 100];
+        let q50 = non_zero_tokens[len * 50 / 100];
+        let q75 = non_zero_tokens[len * 75 / 100];
+        
+        let q25 = q25.max(1);
+        let q50 = q50.max(q25 + 1);
+        let q75 = q75.max(q50 + 1);
+        (q25, q50, q75)
+    };
+
+    state.heatmap_data.weeks = (0..13).map(|c| {
         (0..7).map(|r| {
             let cell_date = grid_start_monday + chrono::Duration::weeks(c as i64) + chrono::Duration::days(r as i64);
             let tokens = stats_by_date.get(&cell_date).map(|s| s.token_info.total()).unwrap_or(0);
-            theme::heatmap_color(tokens)
+            theme::heatmap_color_dynamic(tokens, q25, q50, q75)
         }).collect()
     }).collect();
 
-    state.heatmap_data.stats = (0..28).map(|c| {
+    state.heatmap_data.stats = (0..13).map(|c| {
         (0..7).map(|r| {
             let cell_date = grid_start_monday + chrono::Duration::weeks(c as i64) + chrono::Duration::days(r as i64);
             let stats_opt = stats_by_date.get(&cell_date);
@@ -200,7 +243,7 @@ fn precalculate(state: &mut AppState) {
     let p_cache = if total_classified > 0 { (total_cache as f64 / total_classified as f64) * 100.0 } else { 0.0 };
     let p_reasoning = if total_classified > 0 { (total_reasoning as f64 / total_classified as f64) * 100.0 } else { 0.0 };
 
-    let total_width = 230.0_f32;
+    let total_width = 300.0_f32;
     let gap_size = 1.5_f32;
     let min_width = 5.0_f32;
     
@@ -392,29 +435,52 @@ where
 pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     let view = &state.view;
 
-    // ===== Tab Buttons =====
-    let tab_all = text_button(if state.active_tab == DashTab::Overview { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
+    // ===== Tab Buttons for Single =====
+    let tab_all_single = text_button(if state.active_tab == DashTab::Overview { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
         state.active_tab = DashTab::Overview;
     });
     
-    let tab_antigravity = text_button(if state.active_tab == DashTab::ByModel { "[ Antigravity ]" } else { "Antigravity" }, |state: &mut AppState| {
+    let tab_antigravity_single = text_button(if state.active_tab == DashTab::ByModel { "[ Antigravity ]" } else { "Antigravity" }, |state: &mut AppState| {
         state.active_tab = DashTab::ByModel;
     });
     
-    let tab_codex = text_button(if state.active_tab == DashTab::BySource { "[ Codex ]" } else { "Codex" }, |state: &mut AppState| {
+    let tab_codex_single = text_button(if state.active_tab == DashTab::BySource { "[ Codex ]" } else { "Codex" }, |state: &mut AppState| {
         state.active_tab = DashTab::BySource;
     });
 
-    let tab_bar = flex_row((
-        tab_all,
+    let tab_bar_single = flex_row((
+        tab_all_single,
         FlexSpacer::Fixed(15.0_f32.px()),
-        tab_antigravity,
+        tab_antigravity_single,
         FlexSpacer::Fixed(15.0_f32.px()),
-        tab_codex,
+        tab_codex_single,
+        FlexSpacer::Flex(1.0),
     ));
 
-    // ===== KPI Row =====
-    let kpi_row = flex_row((
+    // ===== Tab Buttons for Dual =====
+    let tab_all_dual = text_button(if state.active_tab == DashTab::Overview { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
+        state.active_tab = DashTab::Overview;
+    });
+    
+    let tab_antigravity_dual = text_button(if state.active_tab == DashTab::ByModel { "[ Antigravity ]" } else { "Antigravity" }, |state: &mut AppState| {
+        state.active_tab = DashTab::ByModel;
+    });
+    
+    let tab_codex_dual = text_button(if state.active_tab == DashTab::BySource { "[ Codex ]" } else { "Codex" }, |state: &mut AppState| {
+        state.active_tab = DashTab::BySource;
+    });
+
+    let tab_bar_dual = flex_row((
+        tab_all_dual,
+        FlexSpacer::Fixed(15.0_f32.px()),
+        tab_antigravity_dual,
+        FlexSpacer::Fixed(15.0_f32.px()),
+        tab_codex_dual,
+        FlexSpacer::Flex(1.0),
+    ));
+
+    // ===== KPI Row for Single =====
+    let kpi_row_single = flex_row((
         metric_card("TOTAL TOKENS", view.total_tokens.total(), view.total_cost, theme::TEXT_CYAN).flex(1.0),
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         metric_card("TOTAL SESSIONS", view.by_project.len() as u64, 0.0, theme::COLOR_SUCCESS).flex(1.0),
@@ -424,68 +490,277 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         metric_card("TOTAL COST", 0, view.total_cost, theme::COLOR_OUTPUT).flex(1.0),
     ));
 
-    // ===== Decoupled Heatmap Module Component =====
-    let heatmap = panel_container(
+    // ===== KPI Row for Dual =====
+    let kpi_row_dual = flex_row((
+        metric_card("TOTAL TOKENS", view.total_tokens.total(), view.total_cost, theme::TEXT_CYAN).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TOTAL SESSIONS", view.by_project.len() as u64, 0.0, theme::COLOR_SUCCESS).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TOTAL MESSAGES", view.record_count, 0.0, theme::COLOR_INPUT).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TOTAL COST", 0, view.total_cost, theme::COLOR_OUTPUT).flex(1.0),
+    ));
+
+    // ===== 1. Tooltip Coordinates and hoverable tooltip (Calculated early) =====
+    let mut x_pos = 0.0;
+    let mut y_pos = 0.0;
+    let mut stats_opt = None;
+
+    if let Some((c_idx, r_idx)) = state.heatmap_ui.hovered_cell {
+        if let Some(week_stats) = state.heatmap_data.stats.get(c_idx) {
+            if let Some(Some(stats)) = week_stats.get(r_idx) {
+                // Precise local base coordinates inside the fixed-width 480px panel
+                // panel padding (16px) + weekday labels (50px) = 66px
+                let x_base = 66.0;
+                
+                let cell_box_size = 24.0;
+                let cell_gap = 4.0;
+
+                // Inside panel, above first cell: padding (16) + title/subtitle block (40) + month header + spacer = 86px
+                let y_base = 86.0;
+
+                let x_offset = x_base + (c_idx as f64) * (cell_box_size + cell_gap);
+                let y_offset = y_base + (r_idx as f64) * (cell_box_size + cell_gap);
+
+                // ALWAYS place to the right of the cell (+ cell_box_size + gap) so it attaches to the side like a context menu,
+                // and avoids covering up the calendar grid!
+                x_pos = x_offset + cell_box_size + cell_gap;
+
+                // Premium floating vertical centering relative to the cell
+                y_pos = y_offset + (cell_box_size / 2.0) - 95.0;
+                stats_opt = Some(stats.clone());
+            }
+        }
+    }
+
+    // ===== 2. Single-column Heatmap view construction =====
+    let tooltip_single = crate::views::heatmap::build_custom_tooltip(stats_opt.clone());
+    let hoverable_tooltip_single = crate::widgets::hoverable(tooltip_single, |state: &mut AppState, hovered| {
+        state.heatmap_ui.popup_hovered = hovered;
+        if !hovered && !state.heatmap_ui.cell_hovered {
+            if let Some(ref tx) = state.worker_tx {
+                let _ = tx.send(WorkerMessage::ClosePopupDelay);
+            }
+        }
+    });
+
+    let heatmap_panel_single = panel_container(
         "TOKEN RETENTION HEATMAP",
         "Current tokens distributed by last modified date",
-        heatmap_view(state.heatmap_ui.clone(), state.heatmap_data.clone(), |state: &mut AppState, cell, hovered| {
-            if hovered {
-                state.heatmap_ui.hovered_cell = Some(cell);
-            } else if state.heatmap_ui.hovered_cell == Some(cell) {
-                state.heatmap_ui.hovered_cell = None;
-            }
-        }),
+        heatmap_view(
+            state.heatmap_ui.clone(),
+            state.heatmap_data.clone(),
+            |state: &mut AppState, cell, hovered| {
+                state.heatmap_ui.cell_hovered = hovered;
+                if hovered {
+                    state.heatmap_ui.popup_hovered = false;
+                    let (c, r) = cell;
+                    let has_stats = state.heatmap_data.stats.get(c)
+                        .and_then(|w| w.get(r))
+                        .and_then(|s| s.as_ref())
+                        .is_some();
+                    if has_stats {
+                        state.heatmap_ui.hovered_cell = Some(cell);
+                    } else {
+                        state.heatmap_ui.hovered_cell = None;
+                        state.heatmap_ui.popup_hovered = false;
+                    }
+                } else {
+                    if !state.heatmap_ui.popup_hovered {
+                        if let Some(ref tx) = state.worker_tx {
+                            let _ = tx.send(WorkerMessage::ClosePopupDelay);
+                        }
+                    }
+                }
+            },
+            |state: &mut AppState, grid_hovered| {
+                if !grid_hovered {
+                    state.heatmap_ui.cell_hovered = false;
+                    if !state.heatmap_ui.popup_hovered {
+                        if let Some(ref tx) = state.worker_tx {
+                            let _ = tx.send(WorkerMessage::ClosePopupDelay);
+                        }
+                    }
+                }
+            },
+        ),
         theme::TEXT_CYAN,
         theme::TEXT_MUTED,
     );
 
-    // ===== Model Usage (Left Column, simple inline bar) =====
-    let model_rows: Vec<_> = state.model_usages.iter().map(|usage| {
+    let heatmap_panel_fixed_single = sized_box(heatmap_panel_single).width(480.0_f32.px());
+
+    let heatmap_with_tooltip_single = crate::widgets::overlay_stack(
+        heatmap_panel_fixed_single,
+        hoverable_tooltip_single,
+        x_pos as f64,
+        y_pos as f64,
+    );
+
+    let heatmap_single = flex_row((
+        FlexSpacer::Flex(1.0),
+        heatmap_with_tooltip_single,
+        FlexSpacer::Flex(1.0),
+    ))
+    .main_axis_alignment(MainAxisAlignment::Center);
+
+    // ===== 3. Dual-column Heatmap view construction =====
+    let tooltip_dual = crate::views::heatmap::build_custom_tooltip(stats_opt.clone());
+    let hoverable_tooltip_dual = crate::widgets::hoverable(tooltip_dual, |state: &mut AppState, hovered| {
+        state.heatmap_ui.popup_hovered = hovered;
+        if !hovered && !state.heatmap_ui.cell_hovered {
+            if let Some(ref tx) = state.worker_tx {
+                let _ = tx.send(WorkerMessage::ClosePopupDelay);
+            }
+        }
+    });
+
+    let heatmap_panel_dual = panel_container(
+        "TOKEN RETENTION HEATMAP",
+        "Current tokens distributed by last modified date",
+        heatmap_view(
+            state.heatmap_ui.clone(),
+            state.heatmap_data.clone(),
+            |state: &mut AppState, cell, hovered| {
+                state.heatmap_ui.cell_hovered = hovered;
+                if hovered {
+                    state.heatmap_ui.popup_hovered = false;
+                    let (c, r) = cell;
+                    let has_stats = state.heatmap_data.stats.get(c)
+                        .and_then(|w| w.get(r))
+                        .and_then(|s| s.as_ref())
+                        .is_some();
+                    if has_stats {
+                        state.heatmap_ui.hovered_cell = Some(cell);
+                    } else {
+                        state.heatmap_ui.hovered_cell = None;
+                        state.heatmap_ui.popup_hovered = false;
+                    }
+                } else {
+                    if !state.heatmap_ui.popup_hovered {
+                        if let Some(ref tx) = state.worker_tx {
+                            let _ = tx.send(WorkerMessage::ClosePopupDelay);
+                        }
+                    }
+                }
+            },
+            |state: &mut AppState, grid_hovered| {
+                if !grid_hovered {
+                    state.heatmap_ui.cell_hovered = false;
+                    if !state.heatmap_ui.popup_hovered {
+                        if let Some(ref tx) = state.worker_tx {
+                            let _ = tx.send(WorkerMessage::ClosePopupDelay);
+                        }
+                    }
+                }
+            },
+        ),
+        theme::TEXT_CYAN,
+        theme::TEXT_MUTED,
+    );
+
+    let heatmap_panel_fixed_dual = sized_box(heatmap_panel_dual).width(480.0_f32.px());
+
+    let heatmap_with_tooltip_dual = crate::widgets::overlay_stack(
+        heatmap_panel_fixed_dual,
+        hoverable_tooltip_dual,
+        x_pos as f64,
+        y_pos as f64,
+    );
+
+    let heatmap_dual = flex_row((
+        FlexSpacer::Flex(1.0),
+        heatmap_with_tooltip_dual,
+        FlexSpacer::Flex(1.0),
+    ))
+    .main_axis_alignment(MainAxisAlignment::Center);
+
+    // ===== 4. Model Usage view constructions =====
+    let model_rows_single: Vec<_> = state.model_usages.iter().map(|usage| {
         let left_view = sized_box(
             label(usage.name.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY)
         );
-
         let right_view = label(usage.subtitle_str.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY);
-
         render_horizontal_bar_row(left_view, right_view, usage.fill_flex, usage.empty_flex)
     }).collect();
 
-    let by_model = panel_container(
+    let by_model_single = panel_container(
         "MODEL USAGE",
         "Ranked by total tokens",
-        flex_col(model_rows),
+        flex_col(model_rows_single),
         theme::TEXT_CYAN,
         theme::TEXT_MUTED,
     );
 
-    // ===== Decoupled Token Breakdown Module Component =====
-    let breakdown = panel_container(
+    let model_rows_dual: Vec<_> = state.model_usages.iter().map(|usage| {
+        let left_view = sized_box(
+            label(usage.name.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY)
+        );
+        let right_view = label(usage.subtitle_str.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY);
+        render_horizontal_bar_row(left_view, right_view, usage.fill_flex, usage.empty_flex)
+    }).collect();
+
+    let by_model_dual = panel_container(
+        "MODEL USAGE",
+        "Ranked by total tokens",
+        flex_col(model_rows_dual),
+        theme::TEXT_CYAN,
+        theme::TEXT_MUTED,
+    );
+
+    // ===== 5. Token Breakdown view constructions =====
+    let breakdown_single = panel_container(
         "Token Breakdown",
         "Proportional shares",
-        breakdown_view(state.breakdown_data.clone()),
+        breakdown_view_horizontal(state.breakdown_data.clone()), // Horizontal Grid Layout!
         theme::TEXT_CYAN,
         theme::TEXT_MUTED,
     );
 
-    // ===== Bottom Scrollable Collectors Row =====
-    let collector_cards: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
+    let breakdown_dual = panel_container(
+        "Token Breakdown",
+        "Proportional shares",
+        breakdown_view_vertical(state.breakdown_data.clone()), // Vertical Stacked Layout!
+        theme::TEXT_CYAN,
+        theme::TEXT_MUTED,
+    );
+
+    // ===== 6. Shared Bottom and Header parts =====
+    let collector_cards_single: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
         collector_card(c)
     }).collect();
 
-    let collector_row = flex_row(collector_cards).gap(12.0_f32.px());
+    let collector_row_single = flex_row(collector_cards_single).gap(12.0_f32.px());
 
-    let collectors_panel = panel_container(
+    let collectors_panel_single = panel_container(
         "ACTIVE TELEMETRY COLLECTORS",
         "Integrated nodes (scroll horizontally)",
-        sized_box(crate::widgets::portal::horizontal_portal(collector_row))
+        sized_box(crate::widgets::portal::horizontal_portal(collector_row_single))
             .height(180.0_f32.px())
             .expand_width(),
         theme::TEXT_CYAN,
         theme::TEXT_MUTED,
     );
 
-    // ===== Decoupled Session Table Module Component =====
-    let session_table = session_table_view(state.sessions_data.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
+    let session_table_single = session_table_view(state.sessions_data.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
+
+    let collector_cards_dual: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
+        collector_card(c)
+    }).collect();
+
+    let collector_row_dual = flex_row(collector_cards_dual).gap(12.0_f32.px());
+
+    let collectors_panel_dual = panel_container(
+        "ACTIVE TELEMETRY COLLECTORS",
+        "Integrated nodes (scroll horizontally)",
+        sized_box(crate::widgets::portal::horizontal_portal(collector_row_dual))
+            .height(180.0_f32.px())
+            .expand_width(),
+        theme::TEXT_CYAN,
+        theme::TEXT_MUTED,
+    );
+
+    let session_table_dual = session_table_view(state.sessions_data.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
 
     let termination_str = if let Some(ref key) = view.cache_termination_key {
         format!(" • Cache boundary: {}", key)
@@ -493,7 +768,6 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         "".to_string()
     };
 
-    // ===== Footer =====
     let footer_text = format!(
         "Last updated: {} • {} total records{}",
         view.last_updated.format("%Y-%m-%d %H:%M:%S UTC"),
@@ -501,139 +775,240 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         termination_str
     );
 
-    // ===== Assemble Full Layout (Grid composition) =====
-    let main_content = flex_col((
-        // Header Bar
+    // Common Header Bar View for Single
+    let header_bar_single = flex_row((
         flex_row((
-            flex_row((
-                label("ANTIGRAVITY TOKEN MONITOR")
-                    .text_size(theme::FONT_SIZE_TITLE)
-                    .color(theme::TEXT_CYAN),
-                FlexSpacer::Fixed(10.0_f32.px()),
-                // Glowing status dot
-                sized_box(label(""))
-                    .width(8.0_f32.px())
-                    .height(8.0_f32.px())
-                    .background_color(theme::COLOR_SUCCESS)
-                    .corner_radius(4.0),
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Center),
-            FlexSpacer::Flex(1.0),
-            flex_col((
-                label(footer_text)
-                    .text_size(theme::FONT_SIZE_SMALL)
-                    .color(theme::TEXT_MUTED),
-                FlexSpacer::Fixed(6.0_f32.px()),
-                {
-                    let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
+            label("ANTIGRAVITY TOKEN MONITOR")
+                .text_size(theme::FONT_SIZE_TITLE)
+                .color(theme::TEXT_CYAN),
+            FlexSpacer::Fixed(10.0_f32.px()),
+            sized_box(label(""))
+                .width(8.0_f32.px())
+                .height(8.0_f32.px())
+                .background_color(theme::COLOR_SUCCESS)
+                .corner_radius(4.0),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+        FlexSpacer::Flex(1.0),
+        flex_col((
+            label(footer_text.clone())
+                .text_size(theme::FONT_SIZE_SMALL)
+                .color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(6.0_f32.px()),
+            {
+                let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
+                    state.dropdown_open = false;
+                    if let Some(ref tx) = state.command_tx {
+                        let _ = tx.try_send(PipelineCommand::Refresh);
+                    }
+                });
+
+                let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
+                    state.dropdown_open = !state.dropdown_open;
+                });
+
+                let split_button = sized_box(
+                    flex_row((
+                        refresh_btn,
+                        label("│").color(theme::TEXT_MUTED),
+                        arrow_btn,
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                )
+                .background_color(theme::BG_INPUT)
+                .corner_radius(4.0)
+                .padding(2.0);
+
+                let dropdown_panel = state.dropdown_open.then(|| {
+                    let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
                         state.dropdown_open = false;
                         if let Some(ref tx) = state.command_tx {
-                            let _ = tx.try_send(PipelineCommand::Refresh);
+                            let _ = tx.try_send(PipelineCommand::Upsert);
                         }
                     });
 
-                    let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
-                        state.dropdown_open = !state.dropdown_open;
+                    let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
+                        state.dropdown_open = false;
+                        if let Some(ref tx) = state.command_tx {
+                            let _ = tx.try_send(PipelineCommand::Rebuild);
+                        }
                     });
 
-                    let split_button = sized_box(
-                        flex_row((
-                            refresh_btn,
-                            label("│").color(theme::TEXT_MUTED),
-                            arrow_btn,
+                    sized_box(
+                        flex_col((
+                            upsert_btn,
+                            FlexSpacer::Fixed(6.0_f32.px()),
+                            rebuild_btn,
                         ))
-                        .cross_axis_alignment(CrossAxisAlignment::Center)
+                        .cross_axis_alignment(CrossAxisAlignment::Fill)
                     )
-                    .background_color(theme::BG_INPUT)
-                    .corner_radius(4.0)
-                    .padding(2.0);
+                    .width(110.0_f32.px())
+                    .background_color(theme::BG_CARD)
+                    .padding(10.0)
+                    .corner_radius(6.0)
+                });
 
-                    let dropdown_panel = state.dropdown_open.then(|| {
-                        let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
-                            state.dropdown_open = false;
-                            if let Some(ref tx) = state.command_tx {
-                                let _ = tx.try_send(PipelineCommand::Upsert);
-                            }
-                        });
+                flex_col((
+                    split_button,
+                    state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
+                    dropdown_panel,
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::End)
+            }
+        )).cross_axis_alignment(CrossAxisAlignment::End),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Start);
 
-                        let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
-                            state.dropdown_open = false;
-                            if let Some(ref tx) = state.command_tx {
-                                let _ = tx.try_send(PipelineCommand::Rebuild);
-                            }
-                        });
+    // Common Header Bar View for Dual
+    let header_bar_dual = flex_row((
+        flex_row((
+            label("ANTIGRAVITY TOKEN MONITOR")
+                .text_size(theme::FONT_SIZE_TITLE)
+                .color(theme::TEXT_CYAN),
+            FlexSpacer::Fixed(10.0_f32.px()),
+            sized_box(label(""))
+                .width(8.0_f32.px())
+                .height(8.0_f32.px())
+                .background_color(theme::COLOR_SUCCESS)
+                .corner_radius(4.0),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center),
+        FlexSpacer::Flex(1.0),
+        flex_col((
+            label(footer_text.clone())
+                .text_size(theme::FONT_SIZE_SMALL)
+                .color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(6.0_f32.px()),
+            {
+                let refresh_btn = text_button("  Refresh  ", |state: &mut AppState| {
+                    state.dropdown_open = false;
+                    if let Some(ref tx) = state.command_tx {
+                        let _ = tx.try_send(PipelineCommand::Refresh);
+                    }
+                });
 
-                        sized_box(
-                            flex_col((
-                                upsert_btn,
-                                FlexSpacer::Fixed(6.0_f32.px()),
-                                rebuild_btn,
-                            ))
-                            .cross_axis_alignment(CrossAxisAlignment::Fill)
-                        )
-                        .width(110.0_f32.px())
-                        .background_color(theme::BG_CARD)
-                        .padding(10.0)
-                        .corner_radius(6.0)
+                let arrow_btn = text_button(if state.dropdown_open { " ▲ " } else { " ▼ " }, |state: &mut AppState| {
+                    state.dropdown_open = !state.dropdown_open;
+                });
+
+                let split_button = sized_box(
+                    flex_row((
+                        refresh_btn,
+                        label("│").color(theme::TEXT_MUTED),
+                        arrow_btn,
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                )
+                .background_color(theme::BG_INPUT)
+                .corner_radius(4.0)
+                .padding(2.0);
+
+                let dropdown_panel = state.dropdown_open.then(|| {
+                    let upsert_btn = text_button("[ Upsert ]", |state: &mut AppState| {
+                        state.dropdown_open = false;
+                        if let Some(ref tx) = state.command_tx {
+                            let _ = tx.try_send(PipelineCommand::Upsert);
+                        }
                     });
 
-                    flex_col((
-                        split_button,
-                        state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
-                        dropdown_panel,
-                    ))
-                    .cross_axis_alignment(CrossAxisAlignment::End)
-                }
-            )).cross_axis_alignment(CrossAxisAlignment::End),
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Start),
+                    let rebuild_btn = text_button("[ Rebuild ]", |state: &mut AppState| {
+                        state.dropdown_open = false;
+                        if let Some(ref tx) = state.command_tx {
+                            let _ = tx.try_send(PipelineCommand::Rebuild);
+                        }
+                    });
 
+                    sized_box(
+                        flex_col((
+                            upsert_btn,
+                            FlexSpacer::Fixed(6.0_f32.px()),
+                            rebuild_btn,
+                        ))
+                        .cross_axis_alignment(CrossAxisAlignment::Fill)
+                    )
+                    .width(110.0_f32.px())
+                    .background_color(theme::BG_CARD)
+                    .padding(10.0)
+                    .corner_radius(6.0)
+                });
+
+                flex_col((
+                    split_button,
+                    state.dropdown_open.then(|| FlexSpacer::Fixed(4.0_f32.px())),
+                    dropdown_panel,
+                ))
+                .cross_axis_alignment(CrossAxisAlignment::End)
+            }
+        )).cross_axis_alignment(CrossAxisAlignment::End),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Start);
+
+    // ===== 7. Responsive Layout Composition =====
+    let main_content_single = flex_col((
+        header_bar_single,
         FlexSpacer::Fixed(16.0_f32.px()),
-
-        tab_bar,
-
+        tab_bar_single,
         FlexSpacer::Fixed(16.0_f32.px()),
-
-        // KPI Cards Row
-        kpi_row,
-
+        kpi_row_single,
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-
-        // Middle layout (Two-column layout composition)
+        heatmap_single,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         flex_row((
-            // Left column: Heatmap + Model Usage
-            flex_col((
-                heatmap,
-                FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-                by_model,
-            ))
-            .cross_axis_alignment(CrossAxisAlignment::Fill)
-            .flex(1.0),
-
-            FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-
-            // Right column: Token Breakdown
-            sized_box(breakdown).width(280.0_f32.px()),
-        )),
-
+            FlexSpacer::Flex(1.0),
+            sized_box(breakdown_single).width(560.0_f32.px()), // 560px for horizontal breakdown grid
+            FlexSpacer::Flex(1.0),
+        ))
+        .main_axis_alignment(MainAxisAlignment::Center),
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-
-        // Bottom panels row (Collector Nodes)
-        collectors_panel,
-
+        by_model_single,
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-
-        // Session analysis list
-        session_table,
+        collectors_panel_single,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        session_table_single,
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill);
 
-    // Wrap in scrollable portal with background
+    let main_content_dual = flex_col((
+        header_bar_dual,
+        FlexSpacer::Fixed(16.0_f32.px()),
+        tab_bar_dual,
+        FlexSpacer::Fixed(16.0_f32.px()),
+        kpi_row_dual,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        flex_row((
+            // Left column: Heatmap + Model Usage
+            flex_col((
+                heatmap_dual,
+                FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+                by_model_dual,
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .flex(1.0),
+            
+            FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+            
+            // Right column: Token Breakdown (vertical sidebar)
+            sized_box(breakdown_dual).width(360.0_f32.px()),
+        )),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        collectors_panel_dual,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        session_table_dual,
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill);
+
     let main_view = vertical_portal(
-        sized_box(main_content)
-            .expand_width()
-            .background_color(theme::BG_MAIN)
-            .padding(20.0)
+        responsive_layout(
+            sized_box(main_content_dual)
+                .expand_width()
+                .background_color(theme::BG_MAIN)
+                .padding(20.0),
+            sized_box(main_content_single)
+                .expand_width()
+                .background_color(theme::BG_MAIN)
+                .padding(20.0),
+            960.0,
+        )
     );
 
     let rx_opt = state.view_rx.clone();
@@ -641,25 +1016,60 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     fork(
         main_view,
         worker_raw(
-            move |proxy, mut _rx: tokio::sync::mpsc::UnboundedReceiver<()>| {
-                let mut rx = rx_opt.clone();
+            move |proxy, mut rx_worker: tokio::sync::mpsc::UnboundedReceiver<WorkerMessage>| {
+                let mut rx_view = rx_opt.clone();
                 async move {
-                    if let Some(ref mut rx) = rx {
-                        loop {
-                            if rx.changed().await.is_err() {
-                                break;
+                    loop {
+                        tokio::select! {
+                            view_changed = async {
+                                if let Some(ref mut rx) = rx_view {
+                                    rx.changed().await.is_ok()
+                                } else {
+                                    std::future::pending::<bool>().await
+                                }
+                            } => {
+                                if view_changed {
+                                    if let Some(ref rx) = rx_view {
+                                        let view = rx.borrow().clone();
+                                        if proxy.message(AppEvent::ViewUpdate(view)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
                             }
-                            let view = rx.borrow().clone();
-                            if proxy.message(view).is_err() {
-                                break;
+                            msg = rx_worker.recv() => {
+                                if let Some(WorkerMessage::ClosePopupDelay) = msg {
+                                    let proxy = proxy.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                        let _ = proxy.message(AppEvent::ClosePopup);
+                                    });
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             },
-            |_state: &mut AppState, _tx| {},
-            |state: &mut AppState, view| {
-                state.update_view(view);
+            |state: &mut AppState, tx| {
+                state.worker_tx = Some(tx);
+            },
+            |state: &mut AppState, event| {
+                match event {
+                    AppEvent::ViewUpdate(view) => {
+                        state.update_view(view);
+                    }
+                    AppEvent::ClosePopup => {
+                        if !state.heatmap_ui.cell_hovered && !state.heatmap_ui.popup_hovered {
+                            state.heatmap_ui.hovered_cell = None;
+                            state.heatmap_ui.popup_hovered = false; // Prevent stuck states
+                            state.heatmap_ui.cell_hovered = false;
+                        }
+                    }
+                }
             }
         )
     )

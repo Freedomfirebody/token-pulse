@@ -35,18 +35,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, error};
 
 use tp_protocol::{DataShowProvider, PoolStorage};
 
-pub mod ccusage;
-pub mod config;
-pub mod model_aliases;
-pub mod parser;
-pub mod rpc;
-pub mod scanner;
-pub mod store;
-pub mod types;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ===== 1. 初始化日志 =====
@@ -188,54 +180,6 @@ async fn run_pipeline(
         tp_collector_antigravity::AntigravityCollector::new(antigravity_root.clone())
     ));
 
-    // 启动后台任务从 VS Code RPC 导出最新的 Token 遥测数据到本地缓存
-    let antigravity_root_clone = antigravity_root.clone();
-    let mut shutdown_rx_exporter = shutdown_rx.clone();
-    tokio::spawn(async move {
-        let session_root = antigravity_root_clone.to_string_lossy().to_string();
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        info!(session_root = %session_root, "启动 Antigravity Telemetry RPC 导出后台任务");
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let config = crate::store::SettingsStore::new(&session_root).load_config();
-                    let session_root_clone = session_root.clone();
-                    let scan_res = tokio::task::spawn_blocking(move || {
-                        let scanner = crate::scanner::SessionScanner::new();
-                        scanner.scan(&session_root_clone)
-                    }).await;
-
-                    let candidates = match scan_res {
-                        Ok(Ok(c)) => c,
-                        _ => {
-                            warn!("Antigravity 目录扫描失败，跳过本次 RPC 导出");
-                            continue;
-                        }
-                    };
-
-                    let exporter = crate::rpc::TrajectoryExporter::new(config);
-                    debug!(candidates = candidates.len(), "开始执行 Antigravity RPC 导出...");
-                    match exporter.export_changed_sessions(&candidates, false, true).await {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!(count, "Antigravity Telemetry RPC 导出成功");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Antigravity Telemetry RPC 导出失败");
-                        }
-                    }
-                }
-                _ = shutdown_rx_exporter.changed() => {
-                    if *shutdown_rx_exporter.borrow() {
-                        info!("Antigravity Telemetry RPC 导出后台任务停止");
-                        break;
-                    }
-                }
-            }
-        }
-    });
 
     // Codex Collector
     coordinator.register(Arc::new(tp_collector_codex::CodexCollector::new()));

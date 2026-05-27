@@ -17,3 +17,5 @@ parking_lot.workspace = true
 dirs.workspace = true
 sysinfo.workspace = true
 sha1.workspace = true
+reqwest.workspace = true
+
