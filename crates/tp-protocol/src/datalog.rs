@@ -10,6 +10,9 @@ use std::time::Duration;
 pub enum SourceName {
     /// Google Gemini Antigravity (VS Code 插件)
     Antigravity,
+    /// Antigravity IDE (文件系统日志直接采集)
+    #[serde(rename = "antigravity_ide", alias = "antigravity_v2")]
+    AntigravityIDE,
     /// OpenAI Codex CLI
     Codex,
     /// Anthropic Claude Code CLI
@@ -20,6 +23,7 @@ impl std::fmt::Display for SourceName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SourceName::Antigravity => write!(f, "Antigravity"),
+            SourceName::AntigravityIDE => write!(f, "Antigravity IDE"),
             SourceName::Codex => write!(f, "Codex"),
             SourceName::CloudeCode => write!(f, "CloudeCode"),
         }

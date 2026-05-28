@@ -1,8 +1,9 @@
 //! Model Usage 渲染组件。
 
 use xilem::{Color, WidgetView, AnyWidgetView};
-use xilem::view::{flex_row, flex_col, label, sized_box, FlexSpacer};
+use xilem::view::{flex_row, flex_col, label, sized_box, FlexSpacer, FlexExt};
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment};
+use xilem::style::Style;
 use crate::theme;
 
 #[derive(Clone)]

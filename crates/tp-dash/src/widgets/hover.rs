@@ -76,19 +76,19 @@ impl Widget for HoverWidget {
         event: &PointerEvent,
     ) {
         let is_hovered = ctx.is_hovered();
-        tracing::info!("HoverWidget event: is_hovered={}, was_hovered={}, event={:?}", is_hovered, self.was_hovered, event);
+        tracing::debug!("HoverWidget event: is_hovered={}, was_hovered={}, event={:?}", is_hovered, self.was_hovered, event);
         
         // Also support standard enter/leave/cancel in case they are generated
         match event {
             PointerEvent::Enter(_) => {
-                tracing::info!("HoverWidget: matched Enter");
+                tracing::debug!("HoverWidget: matched Enter");
                 if !self.was_hovered {
                     self.was_hovered = true;
                     ctx.submit_action::<bool>(true);
                 }
             }
             PointerEvent::Leave(_) | PointerEvent::Cancel(_) => {
-                tracing::info!("HoverWidget: matched Leave/Cancel");
+                tracing::debug!("HoverWidget: matched Leave/Cancel");
                 if self.was_hovered {
                     self.was_hovered = false;
                     ctx.submit_action::<bool>(false);
@@ -97,7 +97,7 @@ impl Widget for HoverWidget {
             _ => {
                 // If standard events aren't generated or are missed, check state changes directly
                 if is_hovered != self.was_hovered {
-                    tracing::info!("HoverWidget state changed: from {} to {}", self.was_hovered, is_hovered);
+                    tracing::debug!("HoverWidget state changed: from {} to {}", self.was_hovered, is_hovered);
                     self.was_hovered = is_hovered;
                     ctx.submit_action::<bool>(is_hovered);
                 }

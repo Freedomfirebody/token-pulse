@@ -6,6 +6,7 @@ members = [
     "crates/tp-cache",
     "crates/tp-collector",
     "plugins/tp-collector-antigravity",
+    "plugins/tp-collector-antigravity-ide",
     "plugins/tp-collector-codex",
     "plugins/tp-collector-claude",
     "crates/tp-aggregator",
@@ -19,31 +20,31 @@ edition = "2024"
 
 [workspace.dependencies]
 # ── Serialization ──
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.142"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 # ── Async Runtime ──
-tokio = { version = "1.52", features = ["full"] }
-async-trait = "0.1.89"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 
 # ── Time ──
 chrono = { version = "0.4.44", features = ["serde"] }
 
 # ── Error / Logging ──
+anyhow = "1"
 thiserror = "2"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ── Concurrency / ID ──
-parking_lot = "0.12.5"
+parking_lot = "0.12"
 uuid = { version = "1.23", features = ["v4"] }
 
 # ── System / IO ──
 dirs = "6.0"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
-sysinfo = "0.38"
+sysinfo = "0.39"
 sha1 = "0.11"
-rayon = "1.10"
 
 # ── UI (Xilem + Linebender stack) ──
 xilem = "0.4"
@@ -55,6 +56,7 @@ tp-compute = { path = "crates/tp-compute" }
 tp-cache = { path = "crates/tp-cache" }
 tp-collector = { path = "crates/tp-collector" }
 tp-collector-antigravity = { path = "plugins/tp-collector-antigravity" }
+tp-collector-antigravity-ide = { path = "plugins/tp-collector-antigravity-ide" }
 tp-collector-codex = { path = "plugins/tp-collector-codex" }
 tp-collector-claude = { path = "plugins/tp-collector-claude" }
 tp-aggregator = { path = "crates/tp-aggregator" }
@@ -73,25 +75,20 @@ path = "src/main.rs"
 # Internal crates
 tp-protocol.workspace = true
 tp-pool.workspace = true
-tp-compute.workspace = true
 tp-cache.workspace = true
 tp-collector.workspace = true
 tp-collector-antigravity.workspace = true
+tp-collector-antigravity-ide.workspace = true
 tp-collector-codex.workspace = true
 tp-collector-claude.workspace = true
 tp-aggregator.workspace = true
 tp-dash.workspace = true
 
 # Runtime
+anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 xilem.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-reqwest.workspace = true
-sha1.workspace = true
-sysinfo.workspace = true
-rayon.workspace = true

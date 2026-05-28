@@ -30,6 +30,211 @@ pub struct TokenBreakdownData {
     pub w_reasoning: f32,
 }
 
+/// Token Breakdown 封装组件
+#[derive(Clone, Default)]
+pub struct BreakdownComponent {
+    pub data: TokenBreakdownData,
+}
+
+impl BreakdownComponent {
+    pub fn new() -> Self {
+        Self {
+            data: TokenBreakdownData::default(),
+        }
+    }
+
+    /// 根据最新的全局数据进行资产投影预计算
+    pub fn update(&mut self, summary: &tp_protocol::view::DashboardView) {
+        let total_input = summary.total_tokens.input;
+        let total_output = summary.total_tokens.output;
+        let total_cache = summary.total_tokens.cache;
+        let total_reasoning = summary.total_tokens.reasoning;
+        
+        let total_classified = total_input + total_output + total_cache + total_reasoning;
+        let total_all = summary.total_tokens.total();
+        let classified_percent = if total_all > 0 {
+            (total_classified as f64 / total_all as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let p_input = if total_classified > 0 { (total_input as f64 / total_classified as f64) * 100.0 } else { 0.0 };
+        let p_output = if total_classified > 0 { (total_output as f64 / total_classified as f64) * 100.0 } else { 0.0 };
+        let p_cache = if total_classified > 0 { (total_cache as f64 / total_classified as f64) * 100.0 } else { 0.0 };
+        let p_reasoning = if total_classified > 0 { (total_reasoning as f64 / total_classified as f64) * 100.0 } else { 0.0 };
+
+        let total_width = 300.0_f32;
+        let gap_size = 1.5_f32;
+        let min_width = 5.0_f32;
+        
+        let values = [total_input, total_output, total_cache, total_reasoning];
+        let active_count = values.iter().filter(|&&v| v > 0).count();
+        
+        let widths = if active_count == 0 {
+            vec![0.0; 4]
+        } else {
+            let total_gaps = if active_count > 1 { (active_count - 1) as f32 * gap_size } else { 0.0 };
+            let usable_width = total_width - total_gaps;
+            let total_min = active_count as f32 * min_width;
+            if total_min >= usable_width {
+                values.iter().map(|&v| if v > 0 { usable_width / active_count as f32 } else { 0.0 }).collect()
+            } else {
+                let remaining = usable_width - total_min;
+                let sum_vals: u64 = values.iter().sum();
+                values.iter().map(|&v| {
+                    if v == 0 {
+                        0.0
+                    } else {
+                        let prop = v as f32 / sum_vals as f32;
+                        min_width + prop * remaining
+                    }
+                }).collect()
+            }
+        };
+
+        self.data = TokenBreakdownData {
+            total_tokens: total_all,
+            total_classified,
+            classified_percent,
+            total_input,
+            p_input,
+            w_input: widths[0],
+            total_output,
+            p_output,
+            w_output: widths[1],
+            total_cache,
+            p_cache,
+            w_cache: widths[2],
+            total_reasoning,
+            p_reasoning,
+            w_reasoning: widths[3],
+        };
+    }
+
+    /// 渲染垂直紧凑模式 (Vertical Mode) - 用于侧边栏 (300px)
+    pub fn view_vertical(&mut self) -> Box<AnyWidgetView<Self>> {
+        let data = &self.data;
+        let mut bar_segments = Vec::new();
+        if data.w_input > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_input, 14.0, theme::COLOR_INPUT));
+        }
+        if data.w_output > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_output, 14.0, theme::COLOR_OUTPUT));
+        }
+        if data.w_cache > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_cache, 14.0, theme::COLOR_CACHE));
+        }
+        if data.w_reasoning > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_reasoning, 14.0, theme::COLOR_REASONING));
+        }
+
+        let segmented_bar = sized_box(
+            flex_row(bar_segments).gap(1.5_f32.px())
+        )
+        .width(300.0_f32.px())
+        .height(14.0_f32.px())
+        .background_color(theme::BG_INPUT)
+        .corner_radius(7.0);
+
+        flex_col((
+            label(theme::format_with_commas(data.total_tokens))
+                .text_size(theme::FONT_SIZE_TITLE)
+                .color(theme::TEXT_PRIMARY),
+            label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(4.0_f32.px()),
+            label(format!(
+                "{} categorized • {:.1}% of total classified",
+                theme::format_with_commas(data.total_classified),
+                data.classified_percent
+            ))
+            .text_size(theme::FONT_SIZE_SMALL)
+            .color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(12.0_f32.px()),
+            segmented_bar,
+            FlexSpacer::Fixed(16.0_f32.px()),
+            render_details_row("INPUT", data.total_input, data.p_input, theme::COLOR_INPUT),
+            FlexSpacer::Fixed(6.0_f32.px()),
+            render_details_row("OUTPUT", data.total_output, data.p_output, theme::COLOR_OUTPUT),
+            FlexSpacer::Fixed(6.0_f32.px()),
+            render_details_row("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
+            FlexSpacer::Fixed(6.0_f32.px()),
+            render_details_row("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
+        ))
+        .boxed()
+    }
+
+    /// 渲染横向自适应模式 (Horizontal Mode) - 用于居中布局 (560px 宽度，带 2x2 网格)
+    pub fn view_horizontal(&mut self) -> Box<AnyWidgetView<Self>> {
+        let data = &self.data;
+        // 进度条在横向模式下较宽，按 560 / 300 比例无损缩放
+        let scale = 560.0_f32 / 300.0_f32;
+        let height = 18.0_f32; // 更厚实、精致的进度条
+
+        let mut bar_segments = Vec::new();
+        if data.w_input > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_input * scale, height, theme::COLOR_INPUT));
+        }
+        if data.w_output > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_output * scale, height, theme::COLOR_OUTPUT));
+        }
+        if data.w_cache > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_cache * scale, height, theme::COLOR_CACHE));
+        }
+        if data.w_reasoning > 0.0 {
+            bar_segments.push(render_bar_segment(data.w_reasoning * scale, height, theme::COLOR_REASONING));
+        }
+
+        let segmented_bar = sized_box(
+            flex_row(bar_segments).gap(1.5_f32.px())
+        )
+        .width(560.0_f32.px())
+        .height(height.px())
+        .background_color(theme::BG_INPUT)
+        .corner_radius(9.0);
+
+        // 2x2 指标卡片网格
+        let grid_row_1 = flex_row((
+            render_horizontal_grid_card("INPUT", data.total_input, data.p_input, theme::COLOR_INPUT),
+            FlexSpacer::Fixed(20.0_f32.px()),
+            render_horizontal_grid_card("OUTPUT", data.total_output, data.p_output, theme::COLOR_OUTPUT),
+        ));
+
+        let grid_row_2 = flex_row((
+            render_horizontal_grid_card("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
+            FlexSpacer::Fixed(20.0_f32.px()),
+            render_horizontal_grid_card("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
+        ));
+
+        let grid = flex_col((
+            grid_row_1,
+            FlexSpacer::Fixed(12.0_f32.px()),
+            grid_row_2,
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Fill);
+
+        flex_col((
+            label(theme::format_with_commas(data.total_tokens))
+                .text_size(theme::FONT_SIZE_TITLE)
+                .color(theme::TEXT_PRIMARY),
+            label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(4.0_f32.px()),
+            label(format!(
+                "{} categorized • {:.1}% of total classified",
+                theme::format_with_commas(data.total_classified),
+                data.classified_percent
+            ))
+            .text_size(theme::FONT_SIZE_SMALL)
+            .color(theme::TEXT_MUTED),
+            FlexSpacer::Fixed(16.0_f32.px()),
+            segmented_bar,
+            FlexSpacer::Fixed(20.0_f32.px()),
+            grid,
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Start)
+        .boxed()
+    }
+}
+
 /// 渲染比例色条中的单个分段
 fn render_bar_segment<State: 'static>(width: f32, height: f32, color: xilem::Color) -> impl WidgetView<State> {
     sized_box(label(""))
@@ -111,125 +316,4 @@ fn render_horizontal_grid_card<State: 'static>(
     .width(270.0_f32.px()) // 2 列卡片： 270px + 20px gap + 270px = 560px 宽度
     .background_color(theme::BG_INPUT)
     .corner_radius(theme::CARD_CORNER_RADIUS)
-}
-
-/// 渲染垂直紧凑模式 (Vertical Mode) - 用于侧边栏 (300px)
-pub fn breakdown_view_vertical<State: 'static>(data: TokenBreakdownData) -> Box<AnyWidgetView<State>> {
-    let mut bar_segments = Vec::new();
-    if data.w_input > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_input, 14.0, theme::COLOR_INPUT));
-    }
-    if data.w_output > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_output, 14.0, theme::COLOR_OUTPUT));
-    }
-    if data.w_cache > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_cache, 14.0, theme::COLOR_CACHE));
-    }
-    if data.w_reasoning > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_reasoning, 14.0, theme::COLOR_REASONING));
-    }
-
-    let segmented_bar = sized_box(
-        flex_row(bar_segments).gap(1.5_f32.px())
-    )
-    .width(300.0_f32.px())
-    .height(14.0_f32.px())
-    .background_color(theme::BG_INPUT)
-    .corner_radius(7.0);
-
-    flex_col((
-        label(theme::format_with_commas(data.total_tokens))
-            .text_size(theme::FONT_SIZE_TITLE)
-            .color(theme::TEXT_PRIMARY),
-        label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED),
-        FlexSpacer::Fixed(4.0_f32.px()),
-        label(format!(
-            "{} categorized • {:.1}% of total classified",
-            theme::format_with_commas(data.total_classified),
-            data.classified_percent
-        ))
-        .text_size(theme::FONT_SIZE_SMALL)
-        .color(theme::TEXT_MUTED),
-        FlexSpacer::Fixed(12.0_f32.px()),
-        segmented_bar,
-        FlexSpacer::Fixed(16.0_f32.px()),
-        render_details_row("INPUT", data.total_input, data.p_input, theme::COLOR_INPUT),
-        FlexSpacer::Fixed(6.0_f32.px()),
-        render_details_row("OUTPUT", data.total_output, data.p_output, theme::COLOR_OUTPUT),
-        FlexSpacer::Fixed(6.0_f32.px()),
-        render_details_row("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
-        FlexSpacer::Fixed(6.0_f32.px()),
-        render_details_row("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
-    ))
-    .boxed()
-}
-
-/// 渲染横向自适应模式 (Horizontal Mode) - 用于居中布局 (560px 宽度，带 2x2 网格)
-pub fn breakdown_view_horizontal<State: 'static>(data: TokenBreakdownData) -> Box<AnyWidgetView<State>> {
-    // 进度条在横向模式下较宽，按 560 / 300 比例无损缩放
-    let scale = 560.0_f32 / 300.0_f32;
-    let height = 18.0_f32; // 更厚实、精致的进度条
-
-    let mut bar_segments = Vec::new();
-    if data.w_input > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_input * scale, height, theme::COLOR_INPUT));
-    }
-    if data.w_output > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_output * scale, height, theme::COLOR_OUTPUT));
-    }
-    if data.w_cache > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_cache * scale, height, theme::COLOR_CACHE));
-    }
-    if data.w_reasoning > 0.0 {
-        bar_segments.push(render_bar_segment(data.w_reasoning * scale, height, theme::COLOR_REASONING));
-    }
-
-    let segmented_bar = sized_box(
-        flex_row(bar_segments).gap(1.5_f32.px())
-    )
-    .width(560.0_f32.px())
-    .height(height.px())
-    .background_color(theme::BG_INPUT)
-    .corner_radius(9.0);
-
-    // 2x2 指标卡片网格
-    let grid_row_1 = flex_row((
-        render_horizontal_grid_card("INPUT", data.total_input, data.p_input, theme::COLOR_INPUT),
-        FlexSpacer::Fixed(20.0_f32.px()),
-        render_horizontal_grid_card("OUTPUT", data.total_output, data.p_output, theme::COLOR_OUTPUT),
-    ));
-
-    let grid_row_2 = flex_row((
-        render_horizontal_grid_card("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
-        FlexSpacer::Fixed(20.0_f32.px()),
-        render_horizontal_grid_card("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
-    ));
-
-    let grid = flex_col((
-        grid_row_1,
-        FlexSpacer::Fixed(12.0_f32.px()),
-        grid_row_2,
-    ))
-    .cross_axis_alignment(CrossAxisAlignment::Fill);
-
-    flex_col((
-        label(theme::format_with_commas(data.total_tokens))
-            .text_size(theme::FONT_SIZE_TITLE)
-            .color(theme::TEXT_PRIMARY),
-        label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED),
-        FlexSpacer::Fixed(4.0_f32.px()),
-        label(format!(
-            "{} categorized • {:.1}% of total classified",
-            theme::format_with_commas(data.total_classified),
-            data.classified_percent
-        ))
-        .text_size(theme::FONT_SIZE_SMALL)
-        .color(theme::TEXT_MUTED),
-        FlexSpacer::Fixed(16.0_f32.px()),
-        segmented_bar,
-        FlexSpacer::Fixed(20.0_f32.px()),
-        grid,
-    ))
-    .cross_axis_alignment(CrossAxisAlignment::Start)
-    .boxed()
 }

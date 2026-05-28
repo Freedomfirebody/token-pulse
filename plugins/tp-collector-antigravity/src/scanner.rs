@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use sha1::{Sha1, Digest};
 
-use crate::types::{SessionScanCandidate, SessionParsePlan};
+use crate::types::{SessionScanCandidate};
 
 pub struct SessionScanner;
 

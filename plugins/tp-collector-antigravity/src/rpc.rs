@@ -60,8 +60,8 @@ impl ProcessLocator {
     }
 
     pub fn detect_processes(&self) -> Vec<ProcessCandidate> {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        let mut sys = System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
         let mut candidates = Vec::new();
 
@@ -100,9 +100,9 @@ impl ProcessLocator {
                         extension_server_csrf_token = arg.split_once('=').map(|(_, v)| v.to_string());
                     } else if arg == "--extension_server_csrf_token" {
                         next_is_ext_token = true;
-                    } else if arg.starts_with("--extension_server_port=") {
+                    } else if arg.starts_with("--extension_server_port=") || arg.starts_with("--https_server_port=") {
                         port = arg.split_once('=').and_then(|(_, v)| v.parse::<u16>().ok());
-                    } else if arg == "--extension_server_port" {
+                    } else if arg == "--extension_server_port" || arg == "--https_server_port" {
                         next_is_port = true;
                     }
                 }
@@ -133,7 +133,12 @@ impl ProcessLocator {
 
 fn is_antigravity_process(args: &[String], name: &str) -> bool {
     let name_lower = name.to_lowercase();
-    if name_lower.contains("language_server") || name_lower.contains("antigravity") {
+    
+    // The language server always runs with --csrf_token and contains either "language_server" or "antigravity"
+    // The GUI wrapper "Antigravity.exe" does not have --csrf_token in its command-line.
+    let has_csrf = args.iter().any(|arg| arg.contains("--csrf_token"));
+    
+    if name_lower.contains("language_server") || (name_lower.contains("antigravity") && has_csrf) {
         return true;
     }
     
@@ -273,6 +278,7 @@ impl AntigravityRpcClient {
     pub fn new(timeout_ms: u64, debug: bool) -> Self {
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
             

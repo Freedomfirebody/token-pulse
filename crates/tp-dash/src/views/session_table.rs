@@ -26,6 +26,76 @@ pub struct SessionTableData {
     pub rows: Vec<SessionRow>,
 }
 
+/// SessionTable 封装组件
+#[derive(Clone, Default)]
+pub struct SessionTableComponent {
+    pub data: SessionTableData,
+}
+
+impl SessionTableComponent {
+    pub fn new() -> Self {
+        Self {
+            data: SessionTableData::default(),
+        }
+    }
+
+    /// 根据全局数据树投影出子组件的分析数据
+    pub fn update(&mut self, summary: &tp_protocol::view::DashboardView) {
+        self.data.rows = summary.by_project.iter().map(|entry| {
+            let total_tokens = entry.token_info.total();
+            let heights = calculate_sparkline_heights(total_tokens);
+            let sparkline_color = if entry.token_info.cache > 0 {
+                theme::TEXT_CYAN
+            } else {
+                theme::COLOR_CACHE
+            };
+
+            SessionRow {
+                key: entry.key.clone(),
+                active_desc: "Active Session • Synced".to_string(),
+                mode_text: "[ACTIVE]".to_string(),
+                is_active: true,
+                record_count: entry.record_count,
+                total_tokens,
+                sparkline_heights: heights,
+                sparkline_color,
+            }
+        }).collect();
+    }
+
+    /// 渲染 Session 分析表格视图
+    pub fn view(&mut self) -> Box<AnyWidgetView<Self>> {
+        let data = self.data.clone();
+        
+        // 1. 表头
+        let table_header = flex_row((
+            sized_box(label("SESSION").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).flex(1.0),
+            sized_box(label("MODE").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(110.0_f32.px()),
+            sized_box(label("MESSAGES").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(90.0_f32.px()),
+            sized_box(label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(140.0_f32.px()),
+            sized_box(label("ACTIVITY PULSE").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(80.0_f32.px()),
+        ))
+        .padding(10.0);
+
+        // 2. 数据行 (使用 into_iter 传值映射)
+        let table_rows: Vec<_> = data.rows.into_iter().map(|row| render_table_row(row)).collect();
+
+        // 3. 带标题的面包容器包裹
+        crate::views::panel::panel_container(
+            "Session Analysis",
+            "Sorted by recent activity",
+            flex_col((
+                table_header,
+                FlexSpacer::Fixed(8.0_f32.px()),
+                flex_col(table_rows).gap(8.0_f32.px()),
+            )),
+            theme::TEXT_CYAN,
+            theme::TEXT_MUTED,
+        )
+        .boxed()
+    }
+}
+
 /// 根据总 Token 数计算 Sparkline 迷你脉冲条高度 (高保真占位计算)
 pub fn calculate_sparkline_heights(tokens: u64) -> Vec<f32> {
     if tokens == 0 {
@@ -137,38 +207,4 @@ fn render_table_row<State: 'static>(row: SessionRow) -> impl WidgetView<State> {
     .background_color(theme::BG_CARD)
     .corner_radius(theme::CARD_CORNER_RADIUS)
     .padding(4.0)
-}
-
-/// 渲染 Session 分析表格视图
-pub fn session_table_view<State: 'static>(
-    data: SessionTableData,
-    title_cyan: xilem::Color,
-    text_muted: xilem::Color,
-) -> Box<AnyWidgetView<State>> {
-    // 1. 表头
-    let table_header = flex_row((
-        sized_box(label("SESSION").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).flex(1.0),
-        sized_box(label("MODE").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(110.0_f32.px()),
-        sized_box(label("MESSAGES").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(90.0_f32.px()),
-        sized_box(label("TOTAL TOKENS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(140.0_f32.px()),
-        sized_box(label("ACTIVITY PULSE").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).width(80.0_f32.px()),
-    ))
-    .padding(10.0);
-
-    // 2. 数据行 (使用 into_iter 传值映射)
-    let table_rows: Vec<_> = data.rows.into_iter().map(|row| render_table_row(row)).collect();
-
-    // 3. 带标题的面包容器包裹
-    crate::views::panel::panel_container(
-        "Session Analysis",
-        "Sorted by recent activity",
-        flex_col((
-            table_header,
-            FlexSpacer::Fixed(8.0_f32.px()),
-            flex_col(table_rows).gap(8.0_f32.px()),
-        )),
-        title_cyan,
-        text_muted,
-    )
-    .boxed()
 }

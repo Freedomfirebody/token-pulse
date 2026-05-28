@@ -1,6 +1,6 @@
 //! # tp-collector-codex
 //!
-//! Codex 数据采集组件 — 原生本地日志扫描与差分解析实现（不再依赖外部 ccusage 进程/服务）。
+//! Codex 数据采集组件 — 原生本地日志扫描与差分解析实现。
 
 use std::fs;
 use std::io::{BufRead, BufReader};

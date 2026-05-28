@@ -38,9 +38,10 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn, error};
 
 use tp_protocol::{DataShowProvider, PoolStorage};
+use anyhow::Result;
 
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     // ===== 1. 初始化日志 =====
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -136,7 +137,7 @@ async fn run_pipeline(
 
     // ===== 初始化 Cache =====
     let cache = Arc::new(
-        tp_cache::DataCache::new(pool.clone() as Arc<dyn tp_protocol::PoolStorage>)
+        tp_cache::DataCache::new(pool.clone() as Arc<dyn PoolStorage>)
     );
 
     // 首次构建缓存
@@ -148,7 +149,7 @@ async fn run_pipeline(
     // ===== 初始化 Aggregator (Data Show) =====
     let aggregator = Arc::new(
         tp_aggregator::DataShow::new(
-            pool.clone() as Arc<dyn tp_protocol::PoolStorage>,
+            pool.clone() as Arc<dyn PoolStorage>,
             cache.clone() as Arc<dyn tp_protocol::CacheProvider>,
         )
     );
@@ -178,6 +179,11 @@ async fn run_pipeline(
         .unwrap_or_else(|| PathBuf::from("."));
     coordinator.register(Arc::new(
         tp_collector_antigravity::AntigravityCollector::new(antigravity_root.clone())
+    ));
+
+    // Antigravity IDE Collector
+    coordinator.register(Arc::new(
+        tp_collector_antigravity_ide::AntigravityIDECollector::new(antigravity_root.clone())
     ));
 
 
