@@ -1,6 +1,6 @@
 //! 热力图组件 — 按日期显示 token 使用 density。
 
-use xilem::{Color, WidgetView};
+use xilem::{Color, WidgetView, AnyWidgetView};
 use xilem::view::{flex_row, flex_col, label, sized_box, FlexSpacer};
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment, MainAxisAlignment};
 use xilem::style::Style;
@@ -155,7 +155,7 @@ pub fn heatmap_view<State: 'static>(
     data: HeatmapData,
     on_hover: impl Fn(&mut State, (usize, usize), bool) + Clone + Send + Sync + 'static,
     on_grid_hover: impl Fn(&mut State, bool) + Clone + Send + Sync + 'static,
-) -> impl WidgetView<State> {
+) -> Box<AnyWidgetView<State>> {
     // 1. 定义大格子的精细布局参数 (适合短周期的 24px 大格子，极其 premium)
     let cell_box_size = 24.0_f32;
     let cell_gap = 4.0_f32;
@@ -312,4 +312,5 @@ pub fn heatmap_view<State: 'static>(
     ))
     .main_axis_alignment(MainAxisAlignment::Start)
     .gap(0.0_f32.px())
+    .boxed()
 }

@@ -7,7 +7,7 @@ use xilem::view::{flex_col, flex_row, label, sized_box, worker_raw, text_button,
 use xilem::style::Style;
 use xilem::core::fork;
 use xilem::core::one_of::Either;
-use xilem::WidgetView;
+use xilem::{WidgetView, AnyWidgetView};
 use chrono::{Datelike, NaiveDate};
 
 use tp_protocol::view::DashboardView;
@@ -21,6 +21,7 @@ use crate::views::heatmap::{HeatmapData, HeatmapUIState, HeatmapDayStats, heatma
 use crate::views::breakdown::{TokenBreakdownData, breakdown_view_vertical, breakdown_view_horizontal};
 use crate::views::session_table::{SessionTableData, SessionRow, session_table_view, calculate_sparkline_heights};
 use crate::views::collector_card::{CollectorCardData, collector_card};
+use crate::views::by_model::{PrecalculatedModelUsage, by_model_view};
 use crate::widgets::responsive_layout;
 use crate::widgets::{hoverable, popover_stack, PopoverConfig, AnchorPoint, PopoverAlign};
 
@@ -41,16 +42,7 @@ pub enum PipelineCommand {
     Rebuild,
 }
 
-#[derive(Clone)]
-pub struct PrecalculatedModelUsage {
-    pub name: String,
-    pub tokens: u64,
-    pub sessions: u64,
-    pub cost_str: String,
-    pub subtitle_str: String,
-    pub fill_flex: f64,
-    pub empty_flex: f64,
-}
+// PrecalculatedModelUsage is now imported from crate::views::by_model
 
 /// Message sent from main UI thread to background worker
 #[derive(Debug, Clone)]
@@ -402,46 +394,7 @@ fn precalculate(state: &mut AppState) {
     }).collect();
 }
 
-/// Renders horizontal model bar rows
-fn render_horizontal_bar_row<L, R, State: 'static>(
-    left_view: L,
-    right_view: R,
-    fill_flex: f64,
-    empty_flex: f64,
-) -> impl WidgetView<State>
-where
-    L: WidgetView<State> + 'static,
-    R: WidgetView<State> + 'static,
-{
-    flex_col((
-        flex_row((
-            left_view,
-            FlexSpacer::Flex(1.0),
-            right_view,
-        ))
-        .cross_axis_alignment(CrossAxisAlignment::Center),
-        FlexSpacer::Fixed(3.0_f32.px()),
-        sized_box(
-            flex_row((
-                sized_box(label(""))
-                    .height(4.0_f32.px())
-                    .expand_width()
-                    .background_color(theme::TEXT_CYAN)
-                    .flex(fill_flex),
-                sized_box(label(""))
-                    .height(4.0_f32.px())
-                    .expand_width()
-                    .background_color(theme::BG_INPUT)
-                    .flex(empty_flex),
-            ))
-            .gap(0.0_f32.px())
-        )
-        .expand_width()
-        .corner_radius(2.0),
-        FlexSpacer::Fixed(6.0_f32.px()),
-    ))
-    .cross_axis_alignment(CrossAxisAlignment::Fill)
-}
+// render_horizontal_bar_row is now defined inside crate::views::by_model
 
 /// 构建行业最高品质、仿 JS (如 shadcn/ui) 高级悬浮特效的操作按钮与下拉浮动面板
 fn build_actions_dropdown(
@@ -450,7 +403,7 @@ fn build_actions_dropdown(
     hovered_dropdown_btn: bool,
     hovered_upsert: bool,
     hovered_rebuild: bool,
-) -> impl WidgetView<AppState> {
+) -> Box<AnyWidgetView<AppState>> {
     // 1. 左半部分：刷新按钮 (高度固定为 28px，宽度固定为 93px，与右半部拼接完美达到 120px 宽度)
     let refresh_btn = hoverable(
         sized_box(
@@ -601,6 +554,7 @@ fn build_actions_dropdown(
             offset_y: 2.0, // 2px 精美间距
         }
     )
+    .boxed()
 }
 
 /// Xilem 应用主入口 — 根据 AppState 构建视图树
@@ -831,37 +785,8 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     .main_axis_alignment(MainAxisAlignment::Start);
 
     // ===== 4. Model Usage view constructions =====
-    let model_rows_single: Vec<_> = state.model_usages.iter().map(|usage| {
-        let left_view = sized_box(
-            label(usage.name.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY)
-        );
-        let right_view = label(usage.subtitle_str.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY);
-        render_horizontal_bar_row(left_view, right_view, usage.fill_flex, usage.empty_flex)
-    }).collect();
-
-    let by_model_single = panel_container(
-        "MODEL USAGE",
-        "Ranked by total tokens",
-        flex_col(model_rows_single),
-        theme::TEXT_CYAN,
-        theme::TEXT_MUTED,
-    );
-
-    let model_rows_dual: Vec<_> = state.model_usages.iter().map(|usage| {
-        let left_view = sized_box(
-            label(usage.name.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_PRIMARY)
-        );
-        let right_view = label(usage.subtitle_str.clone()).text_size(theme::FONT_SIZE_BODY).color(theme::TEXT_SECONDARY);
-        render_horizontal_bar_row(left_view, right_view, usage.fill_flex, usage.empty_flex)
-    }).collect();
-
-    let by_model_dual = panel_container(
-        "MODEL USAGE",
-        "Ranked by total tokens",
-        flex_col(model_rows_dual),
-        theme::TEXT_CYAN,
-        theme::TEXT_MUTED,
-    );
+    let by_model_single = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
+    let by_model_dual = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
 
     // ===== 5. Token Breakdown view constructions =====
     let breakdown_single = panel_container(
@@ -1037,7 +962,8 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
             offset_x: 0.0,
             offset_y: 0.0,
         }
-    );
+    )
+    .boxed();
 
     let main_content_without_header_dual = flex_col((
         FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 头部空间
@@ -1087,7 +1013,8 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
             offset_x: 0.0,
             offset_y: 0.0,
         }
-    );
+    )
+    .boxed();
 
     let main_view = vertical_portal(
         responsive_layout(

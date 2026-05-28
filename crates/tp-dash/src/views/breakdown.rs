@@ -5,7 +5,7 @@
 
 use xilem::view::{flex_row, flex_col, label, sized_box, FlexSpacer};
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment};
-use xilem::WidgetView;
+use xilem::{WidgetView, AnyWidgetView};
 use xilem::style::Style;
 
 use crate::theme;
@@ -114,7 +114,7 @@ fn render_horizontal_grid_card<State: 'static>(
 }
 
 /// 渲染垂直紧凑模式 (Vertical Mode) - 用于侧边栏 (300px)
-pub fn breakdown_view_vertical<State: 'static>(data: TokenBreakdownData) -> impl WidgetView<State> {
+pub fn breakdown_view_vertical<State: 'static>(data: TokenBreakdownData) -> Box<AnyWidgetView<State>> {
     let mut bar_segments = Vec::new();
     if data.w_input > 0.0 {
         bar_segments.push(render_bar_segment(data.w_input, 14.0, theme::COLOR_INPUT));
@@ -161,10 +161,11 @@ pub fn breakdown_view_vertical<State: 'static>(data: TokenBreakdownData) -> impl
         FlexSpacer::Fixed(6.0_f32.px()),
         render_details_row("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
     ))
+    .boxed()
 }
 
 /// 渲染横向自适应模式 (Horizontal Mode) - 用于居中布局 (560px 宽度，带 2x2 网格)
-pub fn breakdown_view_horizontal<State: 'static>(data: TokenBreakdownData) -> impl WidgetView<State> {
+pub fn breakdown_view_horizontal<State: 'static>(data: TokenBreakdownData) -> Box<AnyWidgetView<State>> {
     // 进度条在横向模式下较宽，按 560 / 300 比例无损缩放
     let scale = 560.0_f32 / 300.0_f32;
     let height = 18.0_f32; // 更厚实、精致的进度条
@@ -230,4 +231,5 @@ pub fn breakdown_view_horizontal<State: 'static>(data: TokenBreakdownData) -> im
         grid,
     ))
     .cross_axis_alignment(CrossAxisAlignment::Start)
+    .boxed()
 }

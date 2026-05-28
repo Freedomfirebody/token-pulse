@@ -2,7 +2,7 @@
 
 use xilem::view::{flex_row, flex_col, label, sized_box, FlexSpacer, FlexExt as _};
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment};
-use xilem::WidgetView;
+use xilem::{WidgetView, AnyWidgetView};
 use xilem::style::Style;
 
 use crate::theme;
@@ -144,7 +144,7 @@ pub fn session_table_view<State: 'static>(
     data: SessionTableData,
     title_cyan: xilem::Color,
     text_muted: xilem::Color,
-) -> impl WidgetView<State> {
+) -> Box<AnyWidgetView<State>> {
     // 1. 表头
     let table_header = flex_row((
         sized_box(label("SESSION").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED)).flex(1.0),
@@ -170,4 +170,5 @@ pub fn session_table_view<State: 'static>(
         title_cyan,
         text_muted,
     )
+    .boxed()
 }

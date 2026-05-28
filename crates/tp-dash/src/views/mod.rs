@@ -9,3 +9,7 @@ pub mod tabs;
 pub mod breakdown;
 pub mod session_table;
 pub mod collector_card;
+pub mod by_model;
+
+pub use by_model::{PrecalculatedModelUsage, by_model_view};
+
