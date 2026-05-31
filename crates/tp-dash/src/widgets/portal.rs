@@ -34,7 +34,6 @@ where
         let (child, child_state) = self.child.build(ctx, app_state);
         let widget_pod = ctx.create_pod(
             Portal::new(child.new_widget)
-                .constrain_horizontal(true)
         );
         (widget_pod, child_state)
     }
@@ -105,7 +104,6 @@ where
         let (child, child_state) = self.child.build(ctx, app_state);
         let widget_pod = ctx.create_pod(
             Portal::new(child.new_widget)
-                .constrain_vertical(true)
         );
         (widget_pod, child_state)
     }

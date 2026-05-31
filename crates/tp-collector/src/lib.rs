@@ -100,8 +100,18 @@ impl CollectorCoordinator {
                 let source_name = source.name();
                 let mut last_collected: Option<DateTime<Utc>> = None;
 
-                // 立即执行首次采集
-                let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                // 延迟 3 秒执行首次采集，让 UI 先顺利渲染显示，彻底消除启动时的 CPU/IO 争抢
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
+                        let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                    }
+                    res = shutdown.changed() => {
+                        if res.is_ok() && *shutdown.borrow() {
+                            info!(source = %source_name, "采集器启动被终止");
+                            return;
+                        }
+                    }
+                }
 
                 loop {
                     tokio::select! {
@@ -109,14 +119,22 @@ impl CollectorCoordinator {
                             let _ = collect_and_push(&source, &tx, &mut last_collected).await;
                         }
                         cmd = cmd_rx.recv() => {
-                            if let Ok(command) = cmd {
-                                match command {
-                                    CollectorCommand::TriggerUpsert | CollectorCommand::TriggerRebuild => {
-                                        tracing::info!(source = %source_name, "强制重置拉取被触发 (重置采集截止点为 0)");
-                                        last_collected = None;
-                                        let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                            match cmd {
+                                Ok(command) => {
+                                    match command {
+                                        CollectorCommand::TriggerUpsert | CollectorCommand::TriggerRebuild => {
+                                            tracing::info!(source = %source_name, "强制重置拉取被触发 (重置采集截止点为 0)");
+                                            last_collected = None;
+                                            let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                                        }
                                     }
                                 }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    // 广播通道已关闭，说明 command_tx 已释放，退出以防忙轮询/死锁
+                                    info!(source = %source_name, "采集器命令通道关闭，停止采集器");
+                                    break;
+                                }
+                                Err(_) => {} // Lagged, 忽略继续
                             }
                         }
                         _ = shutdown.changed() => {

@@ -68,6 +68,15 @@ pub struct AggregationSnapshot {
     /// 按天聚合的更详细统计 (含 record_count, cost, message_count)
     #[serde(default)]
     pub by_day_stats: BTreeMap<String, tp_protocol::view::DailyStats>,
+    /// 项目名称映射
+    #[serde(default)]
+    pub project_names: HashMap<String, String>,
+    /// 项目记录计数
+    #[serde(default)]
+    pub project_records: HashMap<String, u64>,
+    /// 项目费用统计
+    #[serde(default)]
+    pub project_costs: HashMap<String, f64>,
 }
 
 impl Default for AggregationSnapshot {
@@ -84,6 +93,9 @@ impl Default for AggregationSnapshot {
             record_count: 0,
             by_report_class: HashMap::new(),
             by_day_stats: BTreeMap::new(),
+            project_names: HashMap::new(),
+            project_records: HashMap::new(),
+            project_costs: HashMap::new(),
         }
     }
 }
@@ -106,6 +118,9 @@ struct AggregationState {
     record_count: u64,
     by_report_class: HashMap<ReportClass, TokenInfo>,
     by_day_stats: BTreeMap<String, tp_protocol::view::DailyStats>,
+    project_names: HashMap<String, String>,
+    project_records: HashMap<String, u64>,
+    project_costs: HashMap<String, f64>,
 }
 
 impl Default for AggregationState {
@@ -122,6 +137,9 @@ impl Default for AggregationState {
             record_count: 0,
             by_report_class: HashMap::new(),
             by_day_stats: BTreeMap::new(),
+            project_names: HashMap::new(),
+            project_records: HashMap::new(),
+            project_costs: HashMap::new(),
         }
     }
 }
@@ -141,6 +159,9 @@ impl AggregationState {
             record_count: snap.record_count,
             by_report_class: snap.by_report_class.clone(),
             by_day_stats: snap.by_day_stats.clone(),
+            project_names: snap.project_names.clone(),
+            project_records: snap.project_records.clone(),
+            project_costs: snap.project_costs.clone(),
         }
     }
 
@@ -158,6 +179,9 @@ impl AggregationState {
             record_count: self.record_count,
             by_report_class: self.by_report_class.clone(),
             by_day_stats: self.by_day_stats.clone(),
+            project_names: self.project_names.clone(),
+            project_records: self.project_records.clone(),
+            project_costs: self.project_costs.clone(),
         }
     }
 
@@ -194,6 +218,15 @@ impl AggregationState {
             entry.record_count += stats.record_count;
             entry.cost_usd += stats.cost_usd;
             entry.message_count += stats.message_count;
+        }
+        for (project, name) in &other.project_names {
+            self.project_names.entry(project.clone()).or_insert_with(|| name.clone());
+        }
+        for (project, count) in &other.project_records {
+            *self.project_records.entry(project.clone()).or_default() += count;
+        }
+        for (project, cost) in &other.project_costs {
+            *self.project_costs.entry(project.clone()).or_default() += cost;
         }
     }
 }
@@ -259,6 +292,13 @@ impl IncrementalAggregator {
             .entry(log.source_project.clone())
             .or_default()
             .accumulate(token);
+
+        // 记录项目名称、记录数与费用
+        if let Some(ref parent) = log.source_parent_project {
+            self.state.project_names.insert(log.source_project.clone(), parent.clone());
+        }
+        *self.state.project_records.entry(log.source_project.clone()).or_default() += 1;
+        *self.state.project_costs.entry(log.source_project.clone()).or_default() += cost;
 
         // 6. 按小时
         let hour_key = log.hour_key();
@@ -352,6 +392,7 @@ impl IncrementalAggregator {
                         token_info: *info,
                         record_count: 0, // 维度级记录数暂不追踪
                         cost_usd: self.pricing.calculate_cost(&source.to_string(), info),
+                        display_name: None,
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -367,6 +408,7 @@ impl IncrementalAggregator {
                         token_info: *info,
                         record_count: 0,
                         cost_usd: self.pricing.calculate_cost(model, info),
+                        display_name: None,
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -377,11 +419,17 @@ impl IncrementalAggregator {
                     .state
                     .by_project
                     .iter()
-                    .map(|(project, info)| DimensionEntry {
-                        key: project.clone(),
-                        token_info: *info,
-                        record_count: 0,
-                        cost_usd: 0.0, // 项目级费用无法精确计算（需要逐条记录模型信息）
+                    .map(|(project, info)| {
+                        let display_name = self.state.project_names.get(project).cloned();
+                        let record_count = self.state.project_records.get(project).copied().unwrap_or(0);
+                        let cost_usd = self.state.project_costs.get(project).copied().unwrap_or(0.0);
+                        DimensionEntry {
+                            key: project.clone(),
+                            token_info: *info,
+                            record_count,
+                            cost_usd,
+                            display_name,
+                        }
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -404,6 +452,7 @@ impl IncrementalAggregator {
                         token_info: *info,
                         record_count: 0,
                         cost_usd: 0.0,
+                        display_name: None,
                     })
                     .collect()
             }
@@ -417,6 +466,7 @@ impl IncrementalAggregator {
                         token_info: *info,
                         record_count: 0,
                         cost_usd: 0.0,
+                        display_name: None,
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -449,6 +499,7 @@ impl IncrementalAggregator {
                 token_info: info,
                 record_count: 0,
                 cost_usd: 0.0,
+                display_name: None,
             })
             .collect()
     }

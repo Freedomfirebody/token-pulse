@@ -193,10 +193,13 @@ impl DataShow {
             &cached_view.by_model,
             &guard.project(&Dimension::ByModel),
         );
-        let by_project = merge_dimension_entries(
+        let registry = tp_protocol::ConversationRegistry::load_default();
+
+        let raw_by_project = merge_dimension_entries(
             &cached_view.by_project,
             &guard.project(&Dimension::ByProject),
         );
+        let by_project = resolve_and_merge_by_project(&raw_by_project, &registry);
 
         // ----- Daily series -----
         let mut daily_series = cached_view.daily_series.clone();
@@ -252,6 +255,13 @@ impl DataShow {
             .collect();
         recent.sort_by(|a, b| b.source_datetime.cmp(&a.source_datetime));
         recent.truncate(50);
+
+        for r in &mut recent {
+            let is_uuid = r.source_project.len() == 36 && r.source_project.chars().filter(|&c| c == '-').count() == 4;
+            if is_uuid {
+                r.source_project = registry.get_title(&r.source_project);
+            }
+        }
 
         Ok(DashboardView {
             total_tokens,
@@ -439,6 +449,9 @@ fn merge_dimension_entries(
                 e.token_info.accumulate(&entry.token_info);
                 e.record_count += entry.record_count;
                 e.cost_usd += entry.cost_usd;
+                if entry.display_name.is_some() {
+                    e.display_name = entry.display_name.clone();
+                }
             })
             .or_insert_with(|| entry.clone());
     }
@@ -449,12 +462,52 @@ fn merge_dimension_entries(
                 e.token_info.accumulate(&entry.token_info);
                 e.record_count += entry.record_count;
                 e.cost_usd += entry.cost_usd;
+                if entry.display_name.is_some() {
+                    e.display_name = entry.display_name.clone();
+                }
             })
             .or_insert_with(|| entry.clone());
     }
 
     let mut result: Vec<_> = map.into_values().collect();
     // Sort by total tokens descending (consistent with IncrementalAggregator.project)
+    result.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
+    result
+}
+
+/// 解析 UUID 会话 ID 为友好的名称映射，并且在内存中合并重复及 Unknown 类别。
+fn resolve_and_merge_by_project(
+    entries: &[tp_protocol::DimensionEntry],
+    registry: &tp_protocol::ConversationRegistry,
+) -> Vec<tp_protocol::DimensionEntry> {
+    use std::collections::HashMap;
+
+    let mut map: HashMap<String, tp_protocol::DimensionEntry> = HashMap::new();
+
+    for entry in entries {
+        let is_uuid = entry.key.len() == 36 && entry.key.chars().filter(|&c| c == '-').count() == 4;
+        let title = if is_uuid {
+            registry.get_title(&entry.key)
+        } else {
+            entry.key.clone()
+        };
+
+        map.entry(title.clone())
+            .and_modify(|e| {
+                e.token_info.accumulate(&entry.token_info);
+                e.record_count += entry.record_count;
+                e.cost_usd += entry.cost_usd;
+            })
+            .or_insert_with(|| tp_protocol::DimensionEntry {
+                key: title.clone(),
+                token_info: entry.token_info,
+                record_count: entry.record_count,
+                cost_usd: entry.cost_usd,
+                display_name: Some(title),
+            });
+    }
+
+    let mut result: Vec<_> = map.into_values().collect();
     result.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
     result
 }

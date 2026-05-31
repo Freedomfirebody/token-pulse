@@ -27,12 +27,14 @@ impl ModelPrice {
         }
     }
 
-    /// 计算给定 token 数据的费用
+    /// 计算给定 token 数据的费用 (精确区分非缓存输入与缓存输入的不同单价进行计算)
     pub fn calculate_cost(&self, token_info: &crate::datalog::TokenInfo) -> f64 {
-        let input_cost = token_info.input as f64 * self.input_cost_per_token;
+        let uncached_input = token_info.input.saturating_sub(token_info.cache);
+        let uncached_cost = uncached_input as f64 * self.input_cost_per_token;
+        let cached_cost = token_info.cache as f64 * self.cache_read_cost_per_token;
         let output_cost = token_info.output as f64 * self.output_cost_per_token;
-        let reasoning_cost = token_info.reasoning as f64 * self.output_cost_per_token; // reasoning 通常按 output 价格
-        input_cost + output_cost + reasoning_cost
+        // reasoning is a subset of output, so it is already accounted for in output_cost.
+        uncached_cost + cached_cost + output_cost
     }
 }
 

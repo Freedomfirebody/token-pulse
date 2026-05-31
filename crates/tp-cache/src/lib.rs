@@ -444,7 +444,7 @@ mod tests {
             meta.get_or_create(
                 &hour_key,
                 std::path::PathBuf::from(format!("data/{hour_key}.jsonl")),
-                PartitionTier::Active,
+                PartitionTier::ArchiveDaily,
             );
             meta.version = self.version.load(Ordering::SeqCst);
         }

@@ -1,7 +1,7 @@
 
 use xilem::masonry::core::{
-    BoxConstraints, EventCtx, LayoutCtx, PaintCtx, RegisterCtx, AccessCtx,
-    Widget, WidgetPod, PointerEvent, PropertiesMut, PropertiesRef,
+    BoxConstraints, LayoutCtx, PaintCtx, RegisterCtx, AccessCtx,
+    Widget, WidgetPod, PropertiesMut, PropertiesRef,
     ChildrenIds,
 };
 use xilem::masonry::kurbo::{Size, Point};
@@ -23,6 +23,7 @@ pub enum AnchorPoint {
     BottomCenter,
     BottomRight,
     Custom(f64, f64),
+    CustomCenterRelative(f64, f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +136,7 @@ impl Widget for PopoverStackWidget {
             AnchorPoint::BottomCenter => (w_m / 2.0, h_m),
             AnchorPoint::BottomRight => (w_m, h_m),
             AnchorPoint::Custom(cx, cy) => (cx, cy),
+            AnchorPoint::CustomCenterRelative(cx, cy) => (w_m / 2.0 + cx, cy),
         };
 
         // 2. Calculate Popover Alignment Point offset on overlay
@@ -171,12 +173,7 @@ impl Widget for PopoverStackWidget {
         ChildrenIds::from_slice(&[self.main.id(), self.overlay.id()])
     }
 
-    fn on_pointer_event(
-        &mut self,
-        _ctx: &mut EventCtx<'_>,
-        _props: &mut PropertiesMut<'_>,
-        _event: &PointerEvent,
-    ) {}
+
 }
 
 pub struct PopoverStack<V1, V2> {

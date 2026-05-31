@@ -44,34 +44,46 @@ impl BreakdownComponent {
     }
 
     /// 根据最新的全局数据进行资产投影预计算
+    ///
+    /// Gemini API 官方 token 模型:
+    /// - total_token_count = prompt_token_count + candidates_token_count + thoughts_token_count
+    /// - cached_content_token_count 是 prompt_token_count 的子集（已包含在内）
+    /// - 因此: INPUT + OUTPUT + REASONING = 100% of Total
+    /// - Cache Hit Rate 为独立指标: cache / input × 100%
     pub fn update(&mut self, summary: &tp_protocol::view::DashboardView) {
+        // Gemini API 模型: input 已包含 cache（cache 是 input 的子集）
         let total_input = summary.total_tokens.input;
         let total_output = summary.total_tokens.output;
-        let total_cache = summary.total_tokens.cache;
         let total_reasoning = summary.total_tokens.reasoning;
-        
-        let total_classified = total_input + total_output + total_cache + total_reasoning;
+        let total_cache = summary.total_tokens.cache;
+
+        // total = input + output + reasoning（Gemini API 官方公式）
         let total_all = summary.total_tokens.total();
+        let total_classified = total_input + total_output + total_reasoning;
         let classified_percent = if total_all > 0 {
             (total_classified as f64 / total_all as f64) * 100.0
         } else {
             0.0
         };
 
+        // INPUT + OUTPUT + REASONING 的百分比应合计 100%
         let p_input = if total_classified > 0 { (total_input as f64 / total_classified as f64) * 100.0 } else { 0.0 };
         let p_output = if total_classified > 0 { (total_output as f64 / total_classified as f64) * 100.0 } else { 0.0 };
-        let p_cache = if total_classified > 0 { (total_cache as f64 / total_classified as f64) * 100.0 } else { 0.0 };
         let p_reasoning = if total_classified > 0 { (total_reasoning as f64 / total_classified as f64) * 100.0 } else { 0.0 };
+        
+        // 缓存命中率: 独立指标，表示输入中缓存命中的比例
+        let p_cache = if total_input > 0 { (total_cache as f64 / total_input as f64) * 100.0 } else { 0.0 };
 
         let total_width = 300.0_f32;
         let gap_size = 1.5_f32;
         let min_width = 5.0_f32;
         
-        let values = [total_input, total_output, total_cache, total_reasoning];
+        // 比例条展示 INPUT, OUTPUT, REASONING 三个维度的占比（不含 cache 段）
+        let values = [total_input, total_output, total_reasoning];
         let active_count = values.iter().filter(|&&v| v > 0).count();
         
         let widths = if active_count == 0 {
-            vec![0.0; 4]
+            vec![0.0; 3]
         } else {
             let total_gaps = if active_count > 1 { (active_count - 1) as f32 * gap_size } else { 0.0 };
             let usable_width = total_width - total_gaps;
@@ -104,10 +116,10 @@ impl BreakdownComponent {
             w_output: widths[1],
             total_cache,
             p_cache,
-            w_cache: widths[2],
+            w_cache: 0.0, // cache 不在比例条中展示，作为独立指标
             total_reasoning,
             p_reasoning,
-            w_reasoning: widths[3],
+            w_reasoning: widths[2],
         };
     }
 
@@ -156,9 +168,9 @@ impl BreakdownComponent {
             FlexSpacer::Fixed(6.0_f32.px()),
             render_details_row("OUTPUT", data.total_output, data.p_output, theme::COLOR_OUTPUT),
             FlexSpacer::Fixed(6.0_f32.px()),
-            render_details_row("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
-            FlexSpacer::Fixed(6.0_f32.px()),
             render_details_row("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
+            FlexSpacer::Fixed(12.0_f32.px()),
+            render_cache_hit_rate_row(data.p_cache),
         ))
         .boxed()
     }
@@ -200,7 +212,7 @@ impl BreakdownComponent {
         ));
 
         let grid_row_2 = flex_row((
-            render_horizontal_grid_card("CACHE", data.total_cache, data.p_cache, theme::COLOR_CACHE),
+            render_horizontal_cache_card(data.p_cache),
             FlexSpacer::Fixed(20.0_f32.px()),
             render_horizontal_grid_card("REASONING", data.total_reasoning, data.p_reasoning, theme::COLOR_REASONING),
         ));
@@ -314,6 +326,58 @@ fn render_horizontal_grid_card<State: 'static>(
         .padding(12.0)
     )
     .width(270.0_f32.px()) // 2 列卡片： 270px + 20px gap + 270px = 560px 宽度
+    .background_color(theme::BG_INPUT)
+    .corner_radius(theme::CARD_CORNER_RADIUS)
+}
+
+/// 渲染缓存命中率条目行 (垂直列表模式)
+fn render_cache_hit_rate_row<State: 'static>(percent: f64) -> impl WidgetView<State> {
+    sized_box(
+        flex_row((
+            label("CONTEXT CACHE HIT RATE".to_string()).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_SECONDARY),
+            FlexSpacer::Flex(1.0),
+            label(format!("{:.1}%", percent))
+                .text_size(theme::FONT_SIZE_BODY)
+                .color(theme::COLOR_CACHE),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Center)
+        .padding(8.0)
+    )
+    .width(300.0_f32.px())
+    .background_color(theme::BG_INPUT)
+    .padding(4.0)
+    .corner_radius(theme::CARD_CORNER_RADIUS)
+}
+
+/// 渲染 2x2 网格卡片中的缓存效率卡片 (横向自适应模式)
+fn render_horizontal_cache_card<State: 'static>(percent: f64) -> impl WidgetView<State> {
+    sized_box(
+        flex_col((
+            // 第一行：指示色块 + 维度名称
+            flex_row((
+                sized_box(label(""))
+                    .width(10.0_f32.px())
+                    .height(10.0_f32.px())
+                    .background_color(theme::COLOR_CACHE)
+                    .corner_radius(2.0),
+                FlexSpacer::Fixed(8.0_f32.px()),
+                label("CACHE HIT RATE".to_string())
+                    .text_size(theme::FONT_SIZE_SMALL)
+                    .color(theme::TEXT_SECONDARY),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Center),
+            
+            FlexSpacer::Fixed(6.0_f32.px()),
+            
+            // 第二行：占比
+            label(format!("{:.1}%", percent))
+                .text_size(theme::FONT_SIZE_BODY)
+                .color(theme::COLOR_CACHE),
+        ))
+        .cross_axis_alignment(CrossAxisAlignment::Start)
+        .padding(12.0)
+    )
+    .width(270.0_f32.px())
     .background_color(theme::BG_INPUT)
     .corner_radius(theme::CARD_CORNER_RADIUS)
 }

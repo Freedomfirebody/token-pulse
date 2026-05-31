@@ -123,6 +123,17 @@ impl PoolStorage for DataPool {
             match decision {
                 ReplaceDecision::Push => {
                     let hour_key = log.hour_key();
+                    tracing::trace!(
+                        "数据池推送新记录: UID={}, 源={}, 模型={}, 类别={:?}, 输入={}, 输出={}, 缓存={}, 推理={}",
+                        log.uid().to_key_string(),
+                        log.source_name,
+                        log.source_model,
+                        log.source_report_class,
+                        log.token_info.input,
+                        log.token_info.output,
+                        log.token_info.cache,
+                        log.token_info.reasoning
+                    );
                     affected_keys.insert(hour_key.clone());
                     by_hour.entry(hour_key).or_default().push(log.clone());
                     result.pushed += 1;
@@ -132,8 +143,18 @@ impl PoolStorage for DataPool {
                     engine.register(log.uid(), log.source_report_class);
                 }
                 ReplaceDecision::Replace => {
-                    // Replace: 需要先读取该小时的数据，替换匹配的记录，再写回
                     let hour_key = log.hour_key();
+                    tracing::debug!(
+                        "数据池覆盖替换记录: UID={}, 源={}, 模型={}, 类别={:?}, 输入={}, 输出={}, 缓存={}, 推理={}",
+                        log.uid().to_key_string(),
+                        log.source_name,
+                        log.source_model,
+                        log.source_report_class,
+                        log.token_info.input,
+                        log.token_info.output,
+                        log.token_info.cache,
+                        log.token_info.reasoning
+                    );
                     affected_keys.insert(hour_key.clone());
                     self.replace_in_hour(&hour_key, log)?;
                     result.replaced += 1;
@@ -144,9 +165,11 @@ impl PoolStorage for DataPool {
                 }
                 ReplaceDecision::Skip => {
                     result.skipped += 1;
-                    tracing::debug!(
-                        "跳过: calculate 不替换 official, project={}",
-                        log.source_project
+                    tracing::info!(
+                        "数据池跳过重复低优先级记录: UID={}, 源={}, 类别={:?}",
+                        log.uid().to_key_string(),
+                        log.source_name,
+                        log.source_report_class
                     );
                 }
             }
@@ -450,8 +473,20 @@ impl DataPool {
     pub fn clear_storage(&self) -> Result<(), PoolError> {
         let active_path = self.base_path.join("active");
         let archive_path = self.base_path.join("archive");
-        let _ = std::fs::remove_dir_all(active_path);
-        let _ = std::fs::remove_dir_all(archive_path);
+        
+        if active_path.exists() {
+            std::fs::remove_dir_all(&active_path).map_err(|e| {
+                tracing::error!("无法清空活跃分片目录: {:?}", e);
+                e
+            })?;
+        }
+        
+        if archive_path.exists() {
+            std::fs::remove_dir_all(&archive_path).map_err(|e| {
+                tracing::error!("无法清空归档分片目录: {:?}", e);
+                e
+            })?;
+        }
 
         // 重置并保存空白元数据
         {

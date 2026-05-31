@@ -11,3 +11,4 @@ async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+dirs.workspace = true

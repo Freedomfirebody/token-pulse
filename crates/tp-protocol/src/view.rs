@@ -34,6 +34,9 @@ pub struct DimensionEntry {
     pub record_count: u64,
     /// 费用 (USD)
     pub cost_usd: f64,
+    /// 显示名称 (可选，如对话的友好名称)
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// 仪表盘完整数据视图

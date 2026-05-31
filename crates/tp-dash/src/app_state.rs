@@ -11,6 +11,7 @@ use xilem::style::Style;
 
 use tp_protocol::view::{DashboardView, DailyStats, RecentRecord, DimensionEntry};
 use tp_protocol::datalog::TokenInfo;
+use tp_protocol::SourceName;
 use std::collections::BTreeMap;
 use chrono::{Utc, Datelike};
 
@@ -20,7 +21,7 @@ use crate::views::panel::panel_container;
 use crate::widgets::portal::vertical_portal;
 
 // 导入高解耦的封装组件状态与数据结构
-// use crate::views::heatmap::HeatmapComponent;
+use crate::views::heatmap::HeatmapComponent;
 use crate::views::breakdown::BreakdownComponent;
 use crate::views::session_table::SessionTableComponent;
 use crate::views::collector_card::{CollectorCardData, collector_card};
@@ -62,6 +63,8 @@ pub enum AppEvent {
 pub struct AppState {
     /// 当前显示的仪表盘数据
     pub view: DashboardView,
+    /// 过滤后用于渲染展现的仪表盘数据
+    pub filtered_view: DashboardView,
     /// 当前活跃标签页
     pub active_tab: DashTab,
     /// 数据刷新请求通道
@@ -70,7 +73,7 @@ pub struct AppState {
     pub view_rx: Option<tokio::sync::watch::Receiver<DashboardView>>,
 
     // ===== 高内聚封装组件挂载 =====
-    // pub heatmap: HeatmapComponent,
+    pub heatmap: HeatmapComponent,
     pub breakdown: BreakdownComponent,
     pub session_table: SessionTableComponent,
     
@@ -100,10 +103,11 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             view: DashboardView::default(),
+            filtered_view: DashboardView::default(),
             active_tab: DashTab::All,
             refresh_tx: None,
             view_rx: None,
-            // heatmap: HeatmapComponent::new(),
+            heatmap: HeatmapComponent::new(),
             breakdown: BreakdownComponent::new(),
             session_table: SessionTableComponent::new(),
             collectors_data: Vec::new(),
@@ -145,92 +149,107 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
     match tab {
         DashTab::All => view.clone(),
         _ => {
-            // 确定要过滤的源标识符列表
-            let target_sources: Vec<&str> = match tab {
-                DashTab::Antigravity => vec!["Antigravity", "Antigravity IDE", "antigravity", "antigravity_ide"],
-                DashTab::Codex => vec!["Codex", "codex"],
-                DashTab::ClaudeCode => vec!["Claude Code", "CloudeCode", "claude_code"],
-                DashTab::All => unreachable!(),
+            let is_match = |s: SourceName| {
+                match tab {
+                    DashTab::All => true,
+                    DashTab::Antigravity => s == SourceName::Antigravity || s == SourceName::AntigravityIDE,
+                    DashTab::Codex => s == SourceName::Codex,
+                    DashTab::ClaudeCode => s == SourceName::CloudeCode,
+                }
             };
 
-            // 1. 过滤 recent records
+            // 1. 基于 recent_records 建立精准的动态 Lookup 关系
+            let mut recent_project_source = std::collections::HashMap::new();
+            let mut recent_model_source = std::collections::HashMap::new();
+            for r in &view.recent_records {
+                recent_project_source.insert(r.source_project.clone(), r.source_name);
+                recent_model_source.insert(r.source_model.clone(), r.source_name);
+            }
+
+            // 2. 项目匹配判定（动态 Lookup 优先 + 后备 Heuristics 判定）
+            let is_project_match = |project: &str| -> bool {
+                if let Some(&s) = recent_project_source.get(project) {
+                    is_match(s)
+                } else {
+                    let is_uuid = project.len() == 36 && project.chars().filter(|&c| c == '-').count() == 4;
+                    let has_slash = project.contains('/');
+                    match tab {
+                        DashTab::Antigravity => is_uuid,
+                        DashTab::Codex => has_slash,
+                        DashTab::ClaudeCode => !is_uuid && !has_slash,
+                        DashTab::All => true,
+                    }
+                }
+            };
+
+            // 3. 模型匹配判定（动态 Lookup 优先 + 后备 Heuristics 判定）
+            let is_model_match = |model: &str| -> bool {
+                if let Some(&s) = recent_model_source.get(model) {
+                    is_match(s)
+                } else {
+                    let m_lower = model.to_lowercase();
+                    match tab {
+                        DashTab::Antigravity => m_lower.contains("gemini"),
+                        DashTab::Codex => m_lower.contains("gpt") || m_lower.contains("codex"),
+                        DashTab::ClaudeCode => m_lower.contains("claude") || m_lower.contains("sonnet") || m_lower.contains("opus"),
+                        DashTab::All => true,
+                    }
+                }
+            };
+
+            // 4. 过滤 recent_records
             let recent_records: Vec<RecentRecord> = view.recent_records
                 .iter()
-                .filter(|r| {
-                    let name_str = r.source_name.to_string();
-                    target_sources.iter().any(|&s| name_str.eq_ignore_ascii_case(s))
-                })
+                .filter(|r| is_match(r.source_name))
                 .cloned()
                 .collect();
 
-            // 2. 过滤 by_source
+            // 5. 过滤 by_source
             let by_source: Vec<DimensionEntry> = view.by_source
                 .iter()
                 .filter(|e| {
-                    target_sources.iter().any(|&s| e.key.eq_ignore_ascii_case(s))
+                    let key_lower = e.key.to_lowercase();
+                    match tab {
+                        DashTab::Antigravity => key_lower.contains("antigravity"),
+                        DashTab::Codex => key_lower.contains("codex"),
+                        DashTab::ClaudeCode => key_lower.contains("claude") || key_lower.contains("cloude") || key_lower.contains("cloude_code") || key_lower.contains("claude_code"),
+                        DashTab::All => true,
+                    }
                 })
                 .cloned()
                 .collect();
 
-            // 3. 依靠最近记录反向动态聚合计算 by_model 与 by_project，以防维度越界
-            let mut model_map: std::collections::HashMap<String, (TokenInfo, u64, f64)> = std::collections::HashMap::new();
-            let mut project_map: std::collections::HashMap<String, (TokenInfo, u64, f64)> = std::collections::HashMap::new();
-            
-            for r in &recent_records {
-                let m_entry = model_map.entry(r.source_model.clone()).or_insert((TokenInfo::default(), 0, 0.0));
-                m_entry.0.accumulate(&r.token_info);
-                m_entry.1 += 1;
-                m_entry.2 += r.cost_usd;
+            // 6. 过滤 by_project 并保留完整的历史汇总数据！
+            let by_project: Vec<DimensionEntry> = view.by_project
+                .iter()
+                .filter(|e| is_project_match(&e.key))
+                .cloned()
+                .collect();
 
-                let p_entry = project_map.entry(r.source_project.clone()).or_insert((TokenInfo::default(), 0, 0.0));
-                p_entry.0.accumulate(&r.token_info);
-                p_entry.1 += 1;
-                p_entry.2 += r.cost_usd;
+            // 7. 过滤 by_model 并保留完整的历史汇总数据！
+            let by_model: Vec<DimensionEntry> = view.by_model
+                .iter()
+                .filter(|e| is_model_match(&e.key))
+                .cloned()
+                .collect();
+
+            // 8. 重新计算总 KPI 与总费用统计（基于过滤后的 project/model 精确汇总）
+            let mut total_tokens = TokenInfo::default();
+            for e in &by_project {
+                total_tokens.accumulate(&e.token_info);
             }
 
-            let mut by_model: Vec<DimensionEntry> = model_map.into_iter().map(|(key, (token_info, record_count, cost_usd))| {
-                DimensionEntry { key, token_info, record_count, cost_usd }
-            }).collect();
-            by_model.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
-
-            let mut by_project: Vec<DimensionEntry> = project_map.into_iter().map(|(key, (token_info, record_count, cost_usd))| {
-                DimensionEntry { key, token_info, record_count, cost_usd }
-            }).collect();
-            by_project.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
-
-            // 4. 重算总 KPI 与费用统计
-            let mut total_tokens = TokenInfo::default();
             let mut total_cost = 0.0;
             let mut record_count = 0;
-            
-            for r in &recent_records {
-                total_tokens.accumulate(&r.token_info);
-                total_cost += r.cost_usd;
-                record_count += 1;
+            for e in &by_model {
+                total_cost += e.cost_usd;
+                record_count += e.record_count;
+            }
+            if record_count == 0 {
+                record_count = by_source.iter().map(|e| e.record_count).sum();
             }
 
-            // 5. 过滤并重新生成 daily_series 热力网格数据
-            let mut daily_series: BTreeMap<String, DailyStats> = BTreeMap::new();
-            for r in &recent_records {
-                let day_key = r.source_datetime.format("%Y-%m-%d").to_string();
-                let stats = daily_series.entry(day_key).or_insert(DailyStats::default());
-                stats.token_info.accumulate(&r.token_info);
-                stats.record_count += 1;
-                stats.cost_usd += r.cost_usd;
-                stats.message_count += 1;
-            }
-
-            // 6. 重新生成今日按小时序列数据
-            let mut hourly_today: BTreeMap<String, TokenInfo> = BTreeMap::new();
-            let today_str = Utc::now().format("%Y-%m-%d").to_string();
-            for r in &recent_records {
-                if r.source_datetime.format("%Y-%m-%d").to_string() == today_str {
-                    let hh = r.source_datetime.format("%H").to_string();
-                    hourly_today.entry(hh).or_default().accumulate(&r.token_info);
-                }
-            }
-
-            // 7. 重算今日/本周/本月指标窗口
+            // 9. 重新生成今日/本周/本月指标窗口
             let mut today_tokens = TokenInfo::default();
             let mut today_cost = 0.0;
             let mut week_tokens = TokenInfo::default();
@@ -240,7 +259,6 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
 
             let now = Utc::now();
             let today_prefix = now.format("%Y-%m-%d").to_string();
-            
             let weekday_offset = now.weekday().num_days_from_monday() as i64;
             let week_start = (now.date_naive() - chrono::Duration::days(weekday_offset)).format("%Y-%m-%d").to_string();
             let month_start = now.format("%Y-%m-01").to_string();
@@ -258,6 +276,46 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
                 if day_key >= month_start {
                     month_tokens.accumulate(&r.token_info);
                     month_cost += r.cost_usd;
+                }
+            }
+
+            // 10. 重新生成 daily_series (热力网格)，保留完整的历史网格展现，但对其数据进行按匹配判定过滤
+            let mut daily_series = BTreeMap::new();
+            for (date_str, _stats) in &view.daily_series {
+                let day_key = date_str.clone();
+                let mut day_tokens = TokenInfo::default();
+                let mut day_records = 0;
+                let mut day_cost = 0.0;
+                let mut day_msg = 0;
+                let mut has_any = false;
+
+                for r in &recent_records {
+                    if r.source_datetime.format("%Y-%m-%d").to_string() == day_key {
+                        day_tokens.accumulate(&r.token_info);
+                        day_records += 1;
+                        day_cost += r.cost_usd;
+                        day_msg += 1;
+                        has_any = true;
+                    }
+                }
+
+                if has_any {
+                    daily_series.insert(day_key, DailyStats {
+                        token_info: day_tokens,
+                        record_count: day_records,
+                        cost_usd: day_cost,
+                        message_count: day_msg,
+                    });
+                }
+            }
+
+            // 11. 重新生成今日按小时序列数据
+            let mut hourly_today: BTreeMap<String, TokenInfo> = BTreeMap::new();
+            let today_str = Utc::now().format("%Y-%m-%d").to_string();
+            for r in &recent_records {
+                if r.source_datetime.format("%Y-%m-%d").to_string() == today_str {
+                    let hh = r.source_datetime.format("%H").to_string();
+                    hourly_today.entry(hh).or_default().accumulate(&r.token_info);
                 }
             }
 
@@ -289,6 +347,7 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
 fn precalculate(state: &mut AppState) {
     let raw_view = state.view.clone();
     let filtered_view = filter_view(&raw_view, state.active_tab);
+    state.filtered_view = filtered_view.clone();
     let view = &filtered_view;
 
     // 1. 投影构建 Model Usage 数据
@@ -313,7 +372,7 @@ fn precalculate(state: &mut AppState) {
     }).collect();
 
     // 2. 调度各封装组件更新其内部私有资产
-    // state.heatmap.update(view);
+    state.heatmap.update(view);
     state.breakdown.update(view);
     state.session_table.update(view);
 
@@ -321,6 +380,10 @@ fn precalculate(state: &mut AppState) {
     let mut antigravity_tokens = 0;
     let mut antigravity_records = 0;
     let mut antigravity_cost = 0.0;
+
+    let mut antigravity_ide_tokens = 0;
+    let mut antigravity_ide_records = 0;
+    let mut antigravity_ide_cost = 0.0;
 
     let mut claude_tokens = 0;
     let mut claude_records = 0;
@@ -337,6 +400,11 @@ fn precalculate(state: &mut AppState) {
                 antigravity_records = entry.record_count;
                 antigravity_cost = entry.cost_usd;
             }
+            "Antigravity IDE" => {
+                antigravity_ide_tokens = entry.token_info.total();
+                antigravity_ide_records = entry.record_count;
+                antigravity_ide_cost = entry.cost_usd;
+            }
             "CloudeCode" => {
                 claude_tokens = entry.token_info.total();
                 claude_records = entry.record_count;
@@ -351,23 +419,52 @@ fn precalculate(state: &mut AppState) {
         }
     }
 
+    let home_dir = dirs::home_dir();
+    
+    // 探测遥测数据源目录是否存在
+    let antigravity_exists = home_dir.as_ref()
+        .map(|h| h.join(".gemini").join("antigravity").exists())
+        .unwrap_or(false);
+        
+    let antigravity_ide_exists = home_dir.as_ref()
+        .map(|h| h.join(".gemini").join("antigravity-ide").exists())
+        .unwrap_or(false);
+        
+    let claude_exists = home_dir.as_ref()
+        .map(|h| h.join(".claude").exists() || h.join(".config").join("claude").exists())
+        .unwrap_or(false);
+        
+    let codex_exists = home_dir.as_ref()
+        .map(|h| h.join(".codex").exists())
+        .unwrap_or(false);
+
     state.collectors_data = vec![
         CollectorCardData {
             name: "Antigravity".to_string(),
             desc: "VS Code extension telemetry".to_string(),
-            status: "ACTIVE".to_string(),
-            status_color: theme::COLOR_SUCCESS,
+            status: if antigravity_exists { "ACTIVE".to_string() } else { "NOT_EXIST".to_string() },
+            status_color: if antigravity_exists { theme::COLOR_SUCCESS } else { theme::TEXT_MUTED },
             path: "~/.gemini/antigravity".to_string(),
             total_tokens: antigravity_tokens,
             records: antigravity_records,
             cost: antigravity_cost,
         },
         CollectorCardData {
+            name: "Antigravity-IDE".to_string(),
+            desc: "IDE offline direct telemetry".to_string(),
+            status: if antigravity_ide_exists { "ACTIVE".to_string() } else { "NOT_EXIST".to_string() },
+            status_color: if antigravity_ide_exists { theme::COLOR_SUCCESS } else { theme::TEXT_MUTED },
+            path: "~/.gemini/antigravity-ide".to_string(),
+            total_tokens: antigravity_ide_tokens,
+            records: antigravity_ide_records,
+            cost: antigravity_ide_cost,
+        },
+        CollectorCardData {
             name: "Claude Code".to_string(),
             desc: "CLI shell token tracker".to_string(),
-            status: "ACTIVE".to_string(),
-            status_color: theme::COLOR_SUCCESS,
-            path: "~/.claude.code/".to_string(),
+            status: if claude_exists { "ACTIVE".to_string() } else { "NOT_EXIST".to_string() },
+            status_color: if claude_exists { theme::COLOR_SUCCESS } else { theme::TEXT_MUTED },
+            path: "~/.claude/".to_string(),
             total_tokens: claude_tokens,
             records: claude_records,
             cost: claude_cost,
@@ -375,22 +472,12 @@ fn precalculate(state: &mut AppState) {
         CollectorCardData {
             name: "Codex".to_string(),
             desc: "Auto-completion agent logs".to_string(),
-            status: "ACTIVE".to_string(),
-            status_color: theme::COLOR_SUCCESS,
+            status: if codex_exists { "ACTIVE".to_string() } else { "NOT_EXIST".to_string() },
+            status_color: if codex_exists { theme::COLOR_SUCCESS } else { theme::TEXT_MUTED },
             path: "~/.codex/".to_string(),
             total_tokens: codex_tokens,
             records: codex_records,
             cost: codex_cost,
-        },
-        CollectorCardData {
-            name: "Pending Node".to_string(),
-            desc: "Awaiting custom telemetry source".to_string(),
-            status: "WAITING".to_string(),
-            status_color: theme::TEXT_MUTED,
-            path: "Configure in settings".to_string(),
-            total_tokens: 0,
-            records: 0,
-            cost: 0.0,
         },
     ];
 }
@@ -552,8 +639,8 @@ fn build_actions_dropdown(
 }
 
 /// Xilem 应用主入口 — 根据 AppState 构建视图树
-pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
-    let view = &state.view;
+fn single_part_1(state: &mut AppState) -> impl WidgetView<AppState> {
+    let view = &state.filtered_view;
 
     // ===== Tab Buttons for Single =====
     let tab_all_single = text_button(if state.active_tab == DashTab::All { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
@@ -599,6 +686,88 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         FlexSpacer::Flex(1.0),
     ))).height(36.0_f32.px());
 
+    // ===== KPI Row for Single =====
+    let kpi_row_single = flex_row((
+        metric_card("TOTAL TOKENS", view.total_tokens.total(), view.total_cost, theme::TEXT_CYAN).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TODAY TOKENS", view.today_tokens.total(), view.today_cost, theme::TEXT_CYAN).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TOTAL SESSIONS", view.by_project.len() as u64, 0.0, theme::COLOR_SUCCESS).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TOTAL MESSAGES", view.record_count, 0.0, theme::COLOR_INPUT).flex(1.0),
+    ));
+
+    flex_col((
+        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 高度给绝对定位悬浮的 Header Bar
+        tab_bar_single,
+        FlexSpacer::Fixed(16.0_f32.px()),
+        kpi_row_single,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
+
+fn single_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
+    flex_col((
+        // Heatmap Component (map_state)
+        xilem::core::map_state(
+            state.heatmap.view(&state.worker_tx),
+            |state: &mut AppState| &mut state.heatmap,
+        ),
+        
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        flex_row((
+            FlexSpacer::Flex(1.0),
+            // Breakdown Component (map_state - Horizontal view)
+            sized_box(xilem::core::map_state(
+                state.breakdown.view_horizontal(),
+                |state: &mut AppState| &mut state.breakdown,
+            ))
+            .width(560.0_f32.px()),
+            FlexSpacer::Flex(1.0),
+        ))
+        .main_axis_alignment(MainAxisAlignment::Center),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
+
+fn single_part_3(state: &mut AppState) -> impl WidgetView<AppState> {
+    let by_model_single = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
+
+    let collector_cards_single: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
+        collector_card(c)
+    }).collect();
+
+    let collector_row_single = flex_row(collector_cards_single).gap(12.0_f32.px());
+
+    let collectors_panel_single = panel_container(
+        "ACTIVE TELEMETRY COLLECTORS",
+        "Integrated nodes (scroll horizontally)",
+        sized_box(crate::widgets::portal::horizontal_portal(collector_row_single))
+            .expand_width(),
+        theme::TEXT_CYAN,
+        theme::TEXT_MUTED,
+    );
+
+    flex_col((
+        by_model_single,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        collectors_panel_single,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        
+        // Session Table Component (map_state)
+        xilem::core::map_state(
+            state.session_table.view(),
+            |state: &mut AppState| &mut state.session_table,
+        ),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
+
+fn dual_part_1(state: &mut AppState) -> impl WidgetView<AppState> {
+    let view = &state.filtered_view;
+
     // ===== Tab Buttons for Dual =====
     let tab_all_dual = text_button(if state.active_tab == DashTab::All { "[ 全部 ]" } else { "全部" }, |state: &mut AppState| {
         state.active_tab = DashTab::All;
@@ -643,49 +812,56 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         FlexSpacer::Flex(1.0),
     ))).height(36.0_f32.px());
 
-    // ===== KPI Row for Single =====
-    let kpi_row_single = flex_row((
-        metric_card("TOTAL TOKENS", view.total_tokens.total(), view.total_cost, theme::TEXT_CYAN).flex(1.0),
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        metric_card("TOTAL SESSIONS", view.by_project.len() as u64, 0.0, theme::COLOR_SUCCESS).flex(1.0),
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        metric_card("TOTAL MESSAGES", view.record_count, 0.0, theme::COLOR_INPUT).flex(1.0),
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        metric_card("TOTAL COST", 0, view.total_cost, theme::COLOR_OUTPUT).flex(1.0),
-    ));
-
     // ===== KPI Row for Dual =====
     let kpi_row_dual = flex_row((
         metric_card("TOTAL TOKENS", view.total_tokens.total(), view.total_cost, theme::TEXT_CYAN).flex(1.0),
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        metric_card("TODAY TOKENS", view.today_tokens.total(), view.today_cost, theme::TEXT_CYAN).flex(1.0),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         metric_card("TOTAL SESSIONS", view.by_project.len() as u64, 0.0, theme::COLOR_SUCCESS).flex(1.0),
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         metric_card("TOTAL MESSAGES", view.record_count, 0.0, theme::COLOR_INPUT).flex(1.0),
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        metric_card("TOTAL COST", 0, view.total_cost, theme::COLOR_OUTPUT).flex(1.0),
     ));
 
-    // ===== Model Usage view constructions =====
-    let by_model_single = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
-    // let by_model_dual = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
+    flex_col((
+        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 头部空间
+        tab_bar_dual,
+        FlexSpacer::Fixed(16.0_f32.px()),
+        kpi_row_dual,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
 
-    // ===== 6. Shared Bottom and Header parts =====
-    let collector_cards_single: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
-        collector_card(c)
-    }).collect();
+fn dual_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
+    let by_model_dual = by_model_view(state.model_usages.clone(), theme::TEXT_CYAN, theme::TEXT_MUTED);
 
-    let collector_row_single = flex_row(collector_cards_single).gap(12.0_f32.px());
+    flex_col((
+        flex_row((
+            // Left column: Heatmap (Adapt) + Model Usage
+            flex_col((
+                xilem::core::map_state(
+                    state.heatmap.view(&state.worker_tx),
+                    |state: &mut AppState| &mut state.heatmap,
+                ),
+                FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+                by_model_dual,
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+            .flex(1.0),
+            // Right column: Token Breakdown (Adapt - vertical view)
+            sized_box(xilem::core::map_state(
+                state.breakdown.view_vertical(),
+                |state: &mut AppState| &mut state.breakdown,
+            ))
+            .width(360.0_f32.px()),
+        )),
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
 
-    let collectors_panel_single = panel_container(
-        "ACTIVE TELEMETRY COLLECTORS",
-        "Integrated nodes (scroll horizontally)",
-        sized_box(crate::widgets::portal::horizontal_portal(collector_row_single))
-            .height(180.0_f32.px())
-            .expand_width(),
-        theme::TEXT_CYAN,
-        theme::TEXT_MUTED,
-    );
-
+fn dual_part_3(state: &mut AppState) -> impl WidgetView<AppState> {
     let collector_cards_dual: Vec<_> = state.collectors_data.iter().cloned().map(|c| {
         collector_card(c)
     }).collect();
@@ -696,11 +872,27 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
         "ACTIVE TELEMETRY COLLECTORS",
         "Integrated nodes (scroll horizontally)",
         sized_box(crate::widgets::portal::horizontal_portal(collector_row_dual))
-            .height(180.0_f32.px())
             .expand_width(),
         theme::TEXT_CYAN,
         theme::TEXT_MUTED,
     );
+
+    flex_col((
+        collectors_panel_dual,
+        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
+        
+        // Session Table Component (map_state)
+        xilem::core::map_state(
+            state.session_table.view(),
+            |state: &mut AppState| &mut state.session_table,
+        ),
+    ))
+    .cross_axis_alignment(CrossAxisAlignment::Fill)
+}
+
+/// Xilem 应用主入口 — 根据 AppState 构建视图树
+pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
+    let view = &state.filtered_view;
 
     let termination_str = if let Some(ref key) = view.cache_termination_key {
         format!(" • Cache boundary: {}", key)
@@ -777,44 +969,15 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     ))
     .cross_axis_alignment(CrossAxisAlignment::Start);
 
-    // ===== 7. Responsive Layout Composition =====
+    // 调用强类型擦除子函数构建三段式列
+    let p1_single = single_part_1(state);
+    let p2_single = single_part_2(state);
+    let p3_single = single_part_3(state);
+
     let main_content_without_header_single = flex_col((
-        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 高度给绝对定位悬浮的 Header Bar
-        tab_bar_single,
-        FlexSpacer::Fixed(16.0_f32.px()),
-        kpi_row_single,
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        
-        // Heatmap Component (map_state)
-        // xilem::core::map_state(
-        //     state.heatmap.view(&state.worker_tx),
-        //     |state: &mut AppState| &mut state.heatmap,
-        // ),
-        
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        flex_row((
-            FlexSpacer::Flex(1.0),
-            // Breakdown Component (map_state - Horizontal view)
-            sized_box(xilem::core::map_state(
-                state.breakdown.view_horizontal(),
-                |state: &mut AppState| &mut state.breakdown,
-            ))
-            .width(560.0_f32.px()),
-            FlexSpacer::Flex(1.0),
-        ))
-        .main_axis_alignment(MainAxisAlignment::Center),
-        
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        by_model_single,
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        collectors_panel_single,
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        
-        // Session Table Component (map_state)
-        xilem::core::map_state(
-            state.session_table.view(),
-            |state: &mut AppState| &mut state.session_table,
-        ),
+        p1_single,
+        p2_single,
+        p3_single,
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill);
 
@@ -830,43 +993,14 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     )
     .boxed();
 
+    let p1_dual = dual_part_1(state);
+    let p2_dual = dual_part_2(state);
+    let p3_dual = dual_part_3(state);
+
     let main_content_without_header_dual = flex_col((
-        FlexSpacer::Fixed(60.0_f32.px()), // 预留 60px 头部空间
-        tab_bar_dual,
-        FlexSpacer::Fixed(16.0_f32.px()),
-        kpi_row_dual,
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        flex_row((
-            // Left column: Heatmap (Adapt) + Model Usage
-            // flex_col((
-            //     xilem::core::map_state(
-            //         state.heatmap.view(&state.worker_tx),
-            //         |state: &mut AppState| &mut state.heatmap,
-            //     ),
-            //     FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-            //     by_model_dual,
-            // ))
-            // .cross_axis_alignment(CrossAxisAlignment::Fill)
-            // .flex(1.0),
-            //
-            // FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-            
-            // Right column: Token Breakdown (Adapt - vertical view)
-            sized_box(xilem::core::map_state(
-                state.breakdown.view_vertical(),
-                |state: &mut AppState| &mut state.breakdown,
-            ))
-            .width(360.0_f32.px()),
-        )),
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        collectors_panel_dual,
-        FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
-        
-        // Session Table Component (map_state)
-        xilem::core::map_state(
-            state.session_table.view(),
-            |state: &mut AppState| &mut state.session_table,
-        ),
+        p1_dual,
+        p2_dual,
+        p3_dual,
     ))
     .cross_axis_alignment(CrossAxisAlignment::Fill);
 
@@ -949,11 +1083,11 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                     }
                     AppEvent::ClosePopup => {
                         // 局部 UI 弹出层彻底重置
-                        // if !state.heatmap.ui.cell_hovered && !state.heatmap.ui.popup_hovered {
-                        //     state.heatmap.ui.hovered_cell = None;
-                        //     state.heatmap.ui.popup_hovered = false;
-                        //     state.heatmap.ui.cell_hovered = false;
-                        // }
+                        if !state.heatmap.ui.cell_hovered && !state.heatmap.ui.popup_hovered {
+                            state.heatmap.ui.hovered_cell = None;
+                            state.heatmap.ui.popup_hovered = false;
+                            state.heatmap.ui.cell_hovered = false;
+                        }
                     }
                 }
             }

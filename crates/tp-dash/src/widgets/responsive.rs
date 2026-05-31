@@ -3,8 +3,8 @@
 //! 动态选用宽屏视图 (wide) 或窄屏视图 (narrow) 进行排版与定位。
 
 use xilem::masonry::core::{
-    BoxConstraints, EventCtx, LayoutCtx, PaintCtx, RegisterCtx, AccessCtx,
-    Widget, WidgetPod, PointerEvent, PropertiesMut, PropertiesRef,
+    BoxConstraints, LayoutCtx, PaintCtx, RegisterCtx, AccessCtx,
+    Widget, WidgetPod, PropertiesMut, PropertiesRef,
     ChildrenIds,
 };
 use xilem::masonry::kurbo::{Size, Point};
@@ -32,6 +32,13 @@ impl ResponsiveLayoutWidget {
             wide: wide.erased().to_pod(),
             narrow: narrow.erased().to_pod(),
             threshold,
+        }
+    }
+
+    pub fn set_threshold(this: &mut xilem::masonry::core::WidgetMut<'_, Self>, threshold: f64) {
+        if this.widget.threshold != threshold {
+            this.widget.threshold = threshold;
+            this.ctx.request_layout();
         }
     }
 
@@ -104,12 +111,7 @@ impl Widget for ResponsiveLayoutWidget {
         ChildrenIds::from_slice(&[self.wide.id(), self.narrow.id()])
     }
 
-    fn on_pointer_event(
-        &mut self,
-        _ctx: &mut EventCtx<'_>,
-        _props: &mut PropertiesMut<'_>,
-        _event: &PointerEvent,
-    ) {}
+
 }
 
 // ===== Xilem View wrapper for ResponsiveLayoutWidget =====
@@ -168,6 +170,7 @@ where
         mut element: Mut<'_, Self::Element>,
         app_state: &mut State,
     ) {
+        ResponsiveLayoutWidget::set_threshold(&mut element, self.threshold);
         ctx.with_id(RESPONSIVE_LAYOUT_WIDE_VIEW_ID, |ctx| {
             let mut child = ResponsiveLayoutWidget::wide_mut(&mut element);
             View::<State, Action, _>::rebuild(

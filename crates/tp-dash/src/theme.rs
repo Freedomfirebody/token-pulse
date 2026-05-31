@@ -103,6 +103,46 @@ pub fn format_with_commas(n: u64) -> String {
     result
 }
 
+/// 计算字符串在 KPI 字体大小 (32px) 下的预估渲染宽度 (单位: 像素)
+pub fn estimate_kpi_text_width(text: &str) -> f32 {
+    let font_size = 32.0;
+    let mut width = 0.0;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            width += font_size * 0.55; // 数字平均宽度比约为 0.55
+        } else if c == ',' {
+            width += font_size * 0.25; // 逗号较窄
+        } else if c == '.' {
+            width += font_size * 0.22; // 小数点较窄
+        } else if c == ' ' {
+            width += font_size * 0.28; // 空格宽度
+        } else if c.is_alphabetic() {
+            width += font_size * 0.60; // 缩写字母 (如 M, K, B, T) 稍微宽一些
+        } else {
+            width += font_size * 0.50; // 其他字符默认按一半高度比例计算
+        }
+    }
+    width
+}
+
+/// 格式化 KPI 数值，若通过宽度估算发现超长则自动转换为高保真缩写 (K, M, B, T)
+pub fn format_kpi_value(value: u64) -> String {
+    let full_str = format_with_commas(value);
+    
+    // 如果超长，则使用高可读性且宽度紧凑的缩写后缀
+    if value >= 1_000_000_000_000 {
+        format!("{:.2} T", value as f64 / 1_000_000_000_000.0)
+    } else if value >= 1_000_000_000 {
+        format!("{:.2} B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.2} M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.2} K", value as f64 / 1_000.0)
+    } else {
+        full_str
+    }
+}
+
 /// 格式化费用显示
 pub fn format_cost(cost: f64) -> String {
     if cost < 0.01 {

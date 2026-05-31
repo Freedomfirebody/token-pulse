@@ -40,7 +40,6 @@ use tracing::{info, warn, error};
 use tp_protocol::{DataShowProvider, PoolStorage};
 use anyhow::Result;
 
-
 fn main() -> Result<()> {
     // ===== 1. 初始化日志 =====
     tracing_subscriber::fmt()
@@ -95,7 +94,7 @@ fn main() -> Result<()> {
             .with_initial_inner_size(xilem::dpi::LogicalSize::new(1100.0, 800.0))
             .with_min_inner_size(xilem::dpi::LogicalSize::new(800.0, 600.0)),
     );
-
+    info!("UI 事件循环开启");
     let run_res = app.run_in(xilem::EventLoop::with_user_event());
     info!("UI 事件循环结束: {:?}", run_res);
 
@@ -135,6 +134,12 @@ async fn run_pipeline(
     );
     info!("Data Pool 就绪");
 
+    // 调试诊断: 启动时强制重置/清空数据池存储，确保每次启动都有一个绝对干净的起点以排查问题
+    info!("调试诊断: 启动时强制清空存储以排查重复统计并重构缓存...");
+    if let Err(e) = pool.clear_storage() {
+        warn!("启动时清空存储失败: {:?}", e);
+    }
+
     // ===== 初始化 Cache =====
     let cache = Arc::new(
         tp_cache::DataCache::new(pool.clone() as Arc<dyn PoolStorage>)
@@ -158,6 +163,10 @@ async fn run_pipeline(
     if let Err(e) = aggregator.refresh().await {
         warn!(error = %e, "聚合器初始刷新失败");
     }
+    // 立即推送初始历史数据给 UI，使页面秒开展现已缓存的历史数据，而不用等待后面的流式采集任务及循环 Tick
+    let initial_view = aggregator.subscribe_view().borrow().clone();
+    let _ = view_tx.send(initial_view);
+    info!("已立即推送初始历史数据到 UI");
 
     // 启动聚合器后台刷新
     let agg_clone = aggregator.clone();
@@ -173,19 +182,21 @@ async fn run_pipeline(
     // 注册数据源
     let mut coordinator = tp_collector::CollectorCoordinator::new(collect_tx);
 
-    // Antigravity Collector
+    // Antigravity VS Code Extension Collector
     let antigravity_root = dirs::home_dir()
         .map(|h| h.join(".gemini").join("antigravity"))
         .unwrap_or_else(|| PathBuf::from("."));
     coordinator.register(Arc::new(
-        tp_collector_antigravity::AntigravityCollector::new(antigravity_root.clone())
+        tp_collector_antigravity::AntigravityCollector::new(antigravity_root.clone(), tp_protocol::SourceName::Antigravity)
     ));
 
-    // Antigravity IDE Collector
+    // Antigravity IDE Offline Collector
+    let antigravity_ide_root = dirs::home_dir()
+        .map(|h| h.join(".gemini").join("antigravity-ide"))
+        .unwrap_or_else(|| PathBuf::from("."));
     coordinator.register(Arc::new(
-        tp_collector_antigravity_ide::AntigravityIDECollector::new(antigravity_root.clone())
+        tp_collector_antigravity::AntigravityCollector::new(antigravity_ide_root.clone(), tp_protocol::SourceName::AntigravityIDE)
     ));
-
 
     // Codex Collector
     coordinator.register(Arc::new(tp_collector_codex::CodexCollector::new()));
@@ -196,68 +207,100 @@ async fn run_pipeline(
     info!(sources = coordinator.source_count(), "Collectors 注册完成");
 
     // ===== 数据摄入管道: collect_rx → pool =====
+    let mut shutdown_rx_ingest = shutdown_rx.clone();
     let pool_for_ingest = pool.clone();
     let cache_for_ingest = cache.clone();
     tokio::spawn(async move {
-        while let Some(logs) = collect_rx.recv().await {
-            if logs.is_empty() { continue; }
-            let count = logs.len();
-            match pool_for_ingest.push_datalogs(logs).await {
-                Ok(result) => {
-                    info!(
-                        pushed = result.pushed,
-                        replaced = result.replaced,
-                        skipped = result.skipped,
-                        "数据已推送到 Pool"
-                    );
-                    // 通知缓存
-                    if !result.affected_hour_keys.is_empty() {
-                        let notification = tp_protocol::PoolNotification::DataPushed {
-                            affected_hour_keys: result.affected_hour_keys,
-                            record_count: count,
-                        };
-                        cache_for_ingest.on_pool_notification(notification).await;
+        loop {
+            tokio::select! {
+                res = shutdown_rx_ingest.changed() => {
+                    if res.is_ok() && *shutdown_rx_ingest.borrow() {
+                        info!("数据摄入任务收到退出信号，正在退出...");
+                        break;
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "推送数据到 Pool 失败");
+                opt = collect_rx.recv() => {
+                    match opt {
+                        Some(logs) => {
+                            if logs.is_empty() { continue; }
+                            let count = logs.len();
+                            match pool_for_ingest.push_datalogs(logs).await {
+                                Ok(result) => {
+                                    info!(
+                                        pushed = result.pushed,
+                                        replaced = result.replaced,
+                                        skipped = result.skipped,
+                                        "数据已推送到 Pool"
+                                    );
+                                    // 通知缓存
+                                    if !result.affected_hour_keys.is_empty() {
+                                        let notification = tp_protocol::PoolNotification::DataPushed {
+                                            affected_hour_keys: result.affected_hour_keys,
+                                            record_count: count,
+                                        };
+                                        cache_for_ingest.on_pool_notification(notification).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "推送数据到 Pool 失败");
+                                }
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
         }
     });
 
     // ===== 监听 UI 管道控制指令 =====
+    let mut shutdown_rx_cmd = shutdown_rx.clone();
     let pool_for_cmd = pool.clone();
     let cache_for_cmd = cache.clone();
     let aggregator_for_cmd = aggregator.clone();
     let collector_cmd_tx_for_cmd = collector_cmd_tx.clone();
     tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            info!("收到管道控制指令: {:?}", cmd);
-            match cmd {
-                tp_dash::PipelineCommand::Refresh => {
-                    info!("执行展示数据 Refresh (重新预计算并渲染)...");
-                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
-                        error!("Refresh 失败: {:?}", e);
+        loop {
+            tokio::select! {
+                res = shutdown_rx_cmd.changed() => {
+                    if res.is_ok() && *shutdown_rx_cmd.borrow() {
+                        info!("指令监听任务收到退出信号，正在退出...");
+                        break;
                     }
                 }
-                tp_dash::PipelineCommand::Upsert => {
-                    info!("执行展示数据 Upsert (采集截止点重置为0，强制从头拉取)...");
-                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerUpsert);
-                }
-                tp_dash::PipelineCommand::Rebuild => {
-                    info!("执行全系统 Rebuild (清空存储、清空缓存、采集点归零并重新拉取)...");
-                    // 1. 清空 pool 物理存储
-                    if let Err(e) = pool_for_cmd.clear_storage() {
-                        error!("清空存储失败: {:?}", e);
-                    }
-                    // 2. 清空 cache 内存状态
-                    cache_for_cmd.clear();
-                    // 3. 广播重置采集器并从 0 强制拉取
-                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerRebuild);
-                    // 4. 立即刷新展示 (将重置为全空状态)
-                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
-                        error!("Refresh 失败: {:?}", e);
+                opt = cmd_rx.recv() => {
+                    match opt {
+                        Some(cmd) => {
+                            info!("收到管道控制指令: {:?}", cmd);
+                            match cmd {
+                                tp_dash::PipelineCommand::Refresh => {
+                                    info!("执行展示数据 Refresh (重新预计算并渲染)...");
+                                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
+                                        error!("Refresh 失败: {:?}", e);
+                                    }
+                                }
+                                tp_dash::PipelineCommand::Upsert => {
+                                    info!("执行展示数据 Upsert (采集截止点重置为0，强制从头拉取)...");
+                                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerUpsert);
+                                }
+                                tp_dash::PipelineCommand::Rebuild => {
+                                    info!("执行全系统 Rebuild (清空存储、清空缓存、采集点归零并重新拉取)...");
+                                    // 1. 清空 pool 物理存储
+                                    if let Err(e) = pool_for_cmd.clear_storage() {
+                                        error!("清空存储失败: {:?}", e);
+                                    }
+                                    // 2. 清空 cache 内存状态
+                                    cache_for_cmd.clear();
+                                    // 3. 广播重置采集器并从 0 强制拉取
+                                    let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerRebuild);
+                                    // 4. 立即刷新展示 (将重置为全空状态)
+                                    if let Err(e) = aggregator_for_cmd.request_refresh().await {
+                                        error!("Refresh 失败: {:?}", e);
+                                    }
+                                }
+                            }
+                        }
+                        None => break,
                     }
                 }
             }
@@ -266,20 +309,28 @@ async fn run_pipeline(
 
     // ===== 启动流式采集 (每个数据源独立并行) =====
     let collect_interval = Duration::from_secs(60); // 每分钟采集一次
+    let shutdown_rx_streaming = shutdown_rx.clone();
     tokio::spawn(async move {
-        coordinator.run_streaming(collect_interval, collector_cmd_tx, shutdown_rx).await;
+        coordinator.run_streaming(collect_interval, collector_cmd_tx, shutdown_rx_streaming).await;
     });
 
     info!("数据管道启动完成");
 
-    // 主管道任务: 定期将 aggregator view 推送到 UI
+    // 主管道任务: 定期将 aggregator view 推送到 UI，支持优雅退出
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     let view_subscriber = aggregator.subscribe_view();
+    let mut shutdown_rx_loop = shutdown_rx.clone();
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let current_view = view_subscriber.borrow().clone();
                 let _ = view_tx.send(current_view);
+            }
+            res = shutdown_rx_loop.changed() => {
+                if res.is_ok() && *shutdown_rx_loop.borrow() {
+                    info!("UI 刷新推送任务收到退出信号，正在退出...");
+                    break Ok(());
+                }
             }
         }
     }
@@ -290,17 +341,5 @@ fn run_startup_diagnostics(data_dir: &PathBuf) {
     println!("\x1b[1;36m=== TOKEN PULSE STARTUP DIAGNOSTICS ===\x1b[0m");
     println!("  Data Directory: {:?}", data_dir);
     println!("  Data Dir Exists: {}", data_dir.exists());
-
-    if let Some(home) = dirs::home_dir() {
-        let brain_dir = home.join(".gemini").join("antigravity").join("brain");
-        println!("  Antigravity Brain: {:?} (exists: {})", brain_dir, brain_dir.exists());
-        if brain_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&brain_dir) {
-                let count = entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
-                println!("  Session Count: \x1b[1;32m{}\x1b[0m", count);
-            }
-        }
-    }
-
     println!("\x1b[1;36m========================================\x1b[0m");
 }

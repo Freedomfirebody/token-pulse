@@ -10,8 +10,15 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     pub fn new(session_root: &str) -> Self {
-        let file_path = PathBuf::from(session_root)
-            .join(".token-monitor")
+        let folder_name = PathBuf::from(session_root)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("antigravity")
+            .to_string();
+        let file_path = dirs::home_dir()
+            .map(|h| h.join(".token-pulse").join("token-monitor"))
+            .unwrap_or_else(|| PathBuf::from(".token-pulse").join("token-monitor"))
+            .join(folder_name)
             .join("settings.json");
         Self { file_path }
     }

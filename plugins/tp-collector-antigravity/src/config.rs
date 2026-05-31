@@ -25,7 +25,7 @@ impl Default for MonitorConfig {
             use_rpc_export: true,
             export_steps_jsonl: false,
             rpc_export_interval_ms: 300_000,
-            rpc_timeout_ms: 5_000,
+            rpc_timeout_ms: 30_000,
         }
     }
 }

@@ -1,12 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use serde::{Serialize, Deserialize};
 use sysinfo::System;
-
 use crate::config::MonitorConfig;
 use crate::types::SessionScanCandidate;
 
@@ -23,21 +20,9 @@ pub struct RpcArtifactManifest {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TrajectorySummary {
-    pub session_id: String,
-    pub last_modified_ms: Option<u64>,
-    pub step_count: Option<u32>,
-}
 
-#[derive(Debug, Clone)]
-pub struct RpcConnectionInfo {
-    pub pid: u32,
-    pub port: u16,
-    pub csrf_token: String,
-}
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProcessCandidate {
     pub pid: u32,
@@ -45,6 +30,7 @@ pub struct ProcessCandidate {
     pub extension_port: u16,
     pub csrf_token: String,
     pub extension_server_csrf_token: Option<String>,
+    pub executable_path: Option<String>,
 }
 
 // ==========================================
@@ -59,7 +45,102 @@ impl ProcessLocator {
         Self { _debug: debug }
     }
 
-    pub fn detect_processes(&self) -> Vec<ProcessCandidate> {
+    pub fn detect_processes(&self, target_app_data_dir: &str) -> Vec<ProcessCandidate> {
+        #[cfg(target_os = "windows")]
+        {
+            let mut wmi_candidates = Vec::new();
+            let output = Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server*' -or $_.Name -like '*antigravity*' } | Select-Object ProcessId, Name, CommandLine, ExecutablePath | ConvertTo-Json -Compress")
+                .output();
+            
+            if let Ok(out) = output {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    let items = if let Some(arr) = val.as_array() {
+                        arr.clone()
+                    } else if val.is_object() {
+                        vec![val]
+                    } else {
+                        Vec::new()
+                    };
+
+                    for item in items {
+                        let pid = item.get("ProcessId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let cmdline = item.get("CommandLine").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let exe_path = item.get("ExecutablePath").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        
+                        let args = split_cmdline(&cmdline);
+                        
+                        let name_lower = name.to_lowercase();
+                        if name_lower.contains("language_server") || name_lower.contains("antigravity") {
+                            if self._debug {
+                                println!("[DEBUG ProcessLocator WMI] Found matching process name: '{}', PID: {}, Args: {:?}", name, pid, args);
+                            }
+                        }
+
+                        if is_antigravity_process(&args, &name, target_app_data_dir) {
+                            let mut csrf_token = None;
+                            let mut extension_server_csrf_token = None;
+                            let mut port = None;
+                            let mut next_is_token = false;
+                            let mut next_is_ext_token = false;
+                            let mut next_is_port = false;
+
+                            for arg in &args {
+                                if next_is_token {
+                                    csrf_token = Some(arg.clone());
+                                    next_is_token = false;
+                                } else if next_is_ext_token {
+                                    extension_server_csrf_token = Some(arg.clone());
+                                    next_is_ext_token = false;
+                                } else if next_is_port {
+                                    if let Ok(p) = arg.parse::<u16>() {
+                                        port = Some(p);
+                                    }
+                                    next_is_port = false;
+                                } else if arg.starts_with("--csrf_token=") {
+                                    csrf_token = arg.split_once('=').map(|(_, v)| v.to_string());
+                                } else if arg == "--csrf_token" {
+                                    next_is_token = true;
+                                } else if arg.starts_with("--extension_server_csrf_token=") {
+                                    extension_server_csrf_token = arg.split_once('=').map(|(_, v)| v.to_string());
+                                } else if arg == "--extension_server_csrf_token" {
+                                    next_is_ext_token = true;
+                                } else if arg.starts_with("--extension_server_port=") || arg.starts_with("--https_server_port=") {
+                                    port = arg.split_once('=').and_then(|(_, v)| v.parse::<u16>().ok());
+                                } else if arg == "--extension_server_port" || arg == "--https_server_port" {
+                                    next_is_port = true;
+                                }
+                            }
+
+                            if let Some(token) = csrf_token {
+                                wmi_candidates.push(ProcessCandidate {
+                                    pid,
+                                    ppid: 0,
+                                    extension_port: port.unwrap_or(0),
+                                    csrf_token: token,
+                                    extension_server_csrf_token,
+                                    executable_path: exe_path,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if !wmi_candidates.is_empty() {
+                let mut by_pid = HashMap::new();
+                for c in wmi_candidates {
+                    by_pid.insert(c.pid, c);
+                }
+                let mut result: Vec<ProcessCandidate> = by_pid.into_values().collect();
+                result.sort_by(|a, b| b.pid.cmp(&a.pid));
+                return result;
+            }
+        }
+
         let mut sys = System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
@@ -72,7 +153,12 @@ impl ProcessLocator {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
 
-            if is_antigravity_process(&args_vec, &name_str) {
+            let name_lower = name_str.to_lowercase();
+            if name_lower.contains("language_server") || name_lower.contains("antigravity") {
+                println!("[DEBUG ProcessLocator] Found matching process name: '{}', PID: {}, Args: {:?}", name_str, pid_u32, args_vec);
+            }
+
+            if is_antigravity_process(&args_vec, &name_str, target_app_data_dir) {
                 let mut csrf_token = None;
                 let mut extension_server_csrf_token = None;
                 let mut port = None;
@@ -109,12 +195,14 @@ impl ProcessLocator {
 
                 if let Some(token) = csrf_token {
                     let ppid = process.parent().map(|p| p.as_u32()).unwrap_or(0);
+                    let exe_path = process.exe().and_then(|p| p.to_str()).map(|s| s.to_string());
                     candidates.push(ProcessCandidate {
                         pid: pid_u32,
                         ppid,
                         extension_port: port.unwrap_or(0),
                         csrf_token: token,
                         extension_server_csrf_token,
+                        executable_path: exe_path,
                     });
                 }
             }
@@ -131,7 +219,29 @@ impl ProcessLocator {
     }
 }
 
-fn is_antigravity_process(args: &[String], name: &str) -> bool {
+fn split_cmdline(cmdline: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in cmdline.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c == ' ' && !in_quotes {
+            if !current.is_empty() {
+                args.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn is_antigravity_process(args: &[String], name: &str, target_app_data_dir: &str) -> bool {
     let name_lower = name.to_lowercase();
     
     // The language server always runs with --csrf_token and contains either "language_server" or "antigravity"
@@ -139,24 +249,53 @@ fn is_antigravity_process(args: &[String], name: &str) -> bool {
     let has_csrf = args.iter().any(|arg| arg.contains("--csrf_token"));
     
     if name_lower.contains("language_server") || (name_lower.contains("antigravity") && has_csrf) {
-        return true;
+        // We must check if --app_data_dir argument matches the target_app_data_dir
+        let mut app_data_dir = None;
+        let mut next_is_app_data = false;
+        for arg in args {
+            let arg_lower = arg.to_lowercase();
+            if next_is_app_data {
+                app_data_dir = Some(arg_lower.clone());
+                next_is_app_data = false;
+            } else if arg_lower == "--app_data_dir" {
+                next_is_app_data = true;
+            } else if arg_lower.starts_with("--app_data_dir=") {
+                app_data_dir = arg_lower.split_once('=').map(|(_, v)| v.to_string());
+            }
+        }
+        
+        if let Some(dir) = app_data_dir {
+            let dir_path = Path::new(&dir);
+            let dir_name = dir_path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            return dir == target_app_data_dir.to_lowercase() || dir_name == target_app_data_dir.to_lowercase();
+        }
+        
+        // If not explicitly set via --app_data_dir, fallback to checking name/args contains target_app_data_dir
+        if name_lower.contains(&target_app_data_dir.to_lowercase()) {
+            return true;
+        }
     }
     
     let mut next_is_app_data = false;
     for arg in args {
         let arg_lower = arg.to_lowercase();
         if next_is_app_data {
-            if arg_lower == "antigravity" {
+            if arg_lower == target_app_data_dir.to_lowercase() {
                 return true;
             }
             next_is_app_data = false;
         } else if arg_lower == "--app_data_dir" {
             next_is_app_data = true;
         } else if arg_lower.starts_with("--app_data_dir=") {
-            if arg_lower.split_once('=').map(|(_, v)| v == "antigravity").unwrap_or(false) {
+            if arg_lower.split_once('=').map(|(_, v)| v == target_app_data_dir.to_lowercase()).unwrap_or(false) {
                 return true;
             }
-        } else if arg_lower.contains("/antigravity/") || arg_lower.contains("\\antigravity\\") {
+        } else if arg_lower.contains(&format!("/{}/", target_app_data_dir.to_lowercase())) 
+            || arg_lower.contains(&format!("\\{}\\", target_app_data_dir.to_lowercase())) 
+        {
             return true;
         }
     }
@@ -263,337 +402,35 @@ fn parse_ports_from_output(stdout: &str) -> Vec<u16> {
     ports
 }
 
-// ==========================================
-// 3. AntigravityRpcClient
-// ==========================================
-pub struct AntigravityRpcClient {
-    client: reqwest::Client,
-    locator: ProcessLocator,
-    timeout_ms: u64,
-    connections: Arc<Mutex<Option<Vec<RpcConnectionInfo>>>>,
-    session_connections: Arc<Mutex<HashMap<String, RpcConnectionInfo>>>,
-}
 
-impl AntigravityRpcClient {
-    pub fn new(timeout_ms: u64, debug: bool) -> Self {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(0)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-            
-        Self {
-            client,
-            locator: ProcessLocator::new(debug),
-            timeout_ms,
-            connections: Arc::new(Mutex::new(None)),
-            session_connections: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub async fn reset_connection(&self) {
-        let mut conns = self.connections.lock().await;
-        *conns = None;
-        let mut sess_conns = self.session_connections.lock().await;
-        sess_conns.clear();
-    }
-
-    pub async fn detect_connections(&self) -> Vec<RpcConnectionInfo> {
-        let process_candidates = self.locator.detect_processes();
-        let mut resolved = Vec::new();
-        
-        for candidate in process_candidates {
-            let ports = PortLocator::get_listening_ports(candidate.pid);
-            for port in ports {
-                // Try extension_server_csrf_token first if present
-                if let Some(ref ext_token) = candidate.extension_server_csrf_token {
-                    if test_port(&self.client, port, ext_token, self.timeout_ms).await {
-                        resolved.push(RpcConnectionInfo {
-                            pid: candidate.pid,
-                            port,
-                            csrf_token: ext_token.clone(),
-                        });
-                        break;
-                    }
-                }
-                
-                // Fallback to standard csrf_token
-                if test_port(&self.client, port, &candidate.csrf_token, self.timeout_ms).await {
-                    resolved.push(RpcConnectionInfo {
-                        pid: candidate.pid,
-                        port,
-                        csrf_token: candidate.csrf_token.clone(),
-                    });
-                    break;
-                }
-            }
-        }
-        resolved
-    }
-
-    pub async fn ensure_connections(&self) -> Vec<RpcConnectionInfo> {
-        let mut conns = self.connections.lock().await;
-        if conns.is_none() {
-            let detected = self.detect_connections().await;
-            *conns = Some(detected);
-        }
-        conns.clone().unwrap_or_default()
-    }
-
-    async fn get_connections_for_session(&self, session_id: &str) -> Vec<RpcConnectionInfo> {
-        let connections = self.ensure_connections().await;
-        let preferred = {
-            let sess_conns = self.session_connections.lock().await;
-            sess_conns.get(session_id).cloned()
-        };
-        
-        match preferred {
-            None => connections,
-            Some(pref) => {
-                let mut result = vec![pref.clone()];
-                for conn in connections {
-                    if conn.pid != pref.pid || conn.port != pref.port {
-                        result.push(conn);
-                    }
-                }
-                result
-            }
-        }
-    }
-
-    async fn request(&self, method: &str, body: serde_json::Value, connection: &RpcConnectionInfo) -> Result<serde_json::Value, String> {
-        let url = format!(
-            "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{}",
-            connection.port, method
-        );
-        
-        let res = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Connect-Protocol-Version", "1")
-            .header("X-Codeium-Csrf-Token", &connection.csrf_token)
-            .json(&body)
-            .timeout(std::time::Duration::from_millis(self.timeout_ms))
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-            
-        if res.status() != reqwest::StatusCode::OK {
-            let status = res.status();
-            let text = res.text().await.unwrap_or_default();
-            return Err(format!("RPC {} failed with status {}: {}", method, status, text));
-        }
-        
-        let val = res.json::<serde_json::Value>()
-            .await
-            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
-            
-        Ok(val)
-    }
-
-    pub async fn list_trajectories(&self) -> Result<Vec<TrajectorySummary>, String> {
-        let connections = self.ensure_connections().await;
-        let mut merged: HashMap<String, (TrajectorySummary, RpcConnectionInfo)> = HashMap::new();
-        
-        for connection in &connections {
-            match self.request("GetAllCascadeTrajectories", serde_json::json!({}), connection).await {
-                Ok(response) => {
-                    let raw_summaries = response.get("trajectorySummaries")
-                        .or_else(|| response.get("cascadeTrajectories"));
-                        
-                    let mut items = Vec::new();
-                    if let Some(raw) = raw_summaries {
-                        if let Some(arr) = raw.as_array() {
-                            items.extend(arr.clone());
-                        } else if let Some(obj) = raw.as_object() {
-                            for (key, val) in obj {
-                                let mut item = val.clone();
-                                if let Some(item_obj) = item.as_object_mut() {
-                                    item_obj.insert("cascadeId".to_string(), serde_json::Value::String(key.clone()));
-                                }
-                                items.push(item);
-                            }
-                        }
-                    }
-                    
-                    let summaries: Vec<TrajectorySummary> = items.iter()
-                        .filter_map(|item| normalize_summary(item))
-                        .collect();
-                        
-                    for summary in summaries {
-                        let session_id = summary.session_id.clone();
-                        let existing = merged.get(&session_id);
-                        let should_insert = match existing {
-                            None => true,
-                            Some((existing_summary, _)) => is_better_summary(&summary, existing_summary),
-                        };
-                        if should_insert {
-                            merged.insert(session_id, (summary, connection.clone()));
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("[RPC] list_trajectories error on pid={}: {}", connection.pid, e);
-                }
-            }
-        }
-        
-        let mut session_conns = self.session_connections.lock().await;
-        session_conns.clear();
-        for (session_id, (_, conn)) in &merged {
-            session_conns.insert(session_id.clone(), conn.clone());
-        }
-        
-        let summaries: Vec<TrajectorySummary> = merged.into_values().map(|(s, _)| s).collect();
-        Ok(summaries)
-    }
-
-    pub async fn get_trajectory_steps(&self, session_id: &str) -> Vec<serde_json::Value> {
-        let connections = self.get_connections_for_session(session_id).await;
-        for connection in connections {
-            match self.request("GetCascadeTrajectory", serde_json::json!({ "cascadeId": session_id }), &connection).await {
-                Ok(result) => {
-                    if let Some(steps) = result.get("trajectory").and_then(|t| t.get("steps")).and_then(|s| s.as_array()) {
-                        return steps.clone();
-                    }
-                }
-                Err(e) => {
-                    println!("[RPC] GetCascadeTrajectory failed for {} on pid={}: {}", session_id, connection.pid, e);
-                }
-            }
-            
-            match self.request("GetCascadeTrajectorySteps", serde_json::json!({
-                "cascadeId": session_id,
-                "startIndex": 0,
-                "endIndex": 10000
-            }), &connection).await {
-                Ok(fallback) => {
-                    if let Some(steps) = fallback.get("steps").or_else(|| fallback.get("step")).and_then(|s| s.as_array()) {
-                        return steps.clone();
-                    }
-                }
-                Err(e) => {
-                    println!("[RPC] GetCascadeTrajectorySteps failed for {} on pid={}: {}", session_id, connection.pid, e);
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    pub async fn get_trajectory_metadata(&self, session_id: &str) -> Vec<serde_json::Value> {
-        let connections = self.get_connections_for_session(session_id).await;
-        for connection in connections {
-            match self.request("GetCascadeTrajectoryGeneratorMetadata", serde_json::json!({ "cascadeId": session_id }), &connection).await {
-                Ok(result) => {
-                    if let Some(meta) = result.get("generatorMetadata").and_then(|m| m.as_array()) {
-                        return meta.clone();
-                    }
-                }
-                Err(e) => {
-                    println!("[RPC] GetCascadeTrajectoryGeneratorMetadata failed for {} on pid={}: {}", session_id, connection.pid, e);
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    pub async fn flush(&self) {
-        let connections = self.ensure_connections().await;
-        for connection in connections {
-            let _ = self.request("SendAllQueuedMessages", serde_json::json!({}), &connection).await;
-        }
-    }
-}
-
-async fn test_port(client: &reqwest::Client, port: u16, csrf_token: &str, timeout_ms: u64) -> bool {
-    let url = format!("https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/Heartbeat", port);
-    let body = serde_json::json!({ "uuid": "00000000-0000-0000-0000-000000000000" });
-    
-    let res = client.post(&url)
-        .header("Content-Type", "application/json")
-        .header("Connect-Protocol-Version", "1")
-        .header("X-Codeium-Csrf-Token", csrf_token)
-        .json(&body)
-        .timeout(std::time::Duration::from_millis(timeout_ms))
-        .send()
-        .await;
-        
-    match res {
-        Ok(response) => response.status() == reqwest::StatusCode::OK,
-        Err(_) => false,
-    }
-}
-
-fn normalize_summary(val: &serde_json::Value) -> Option<TrajectorySummary> {
-    let obj = val.as_object()?;
-    
-    let session_id = obj.get("cascadeId")
-        .or_else(|| obj.get("trajectoryId"))
-        .or_else(|| obj.get("id"))
-        .or_else(|| obj.get("sessionId"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())?;
-        
-    if session_id.trim().is_empty() {
-        return None;
-    }
-    
-    let last_modified_ms = obj.get("lastModifiedTime")
-        .or_else(|| obj.get("lastModified"))
-        .or_else(|| obj.get("updatedAt"))
-        .or_else(|| obj.get("modifiedAt"))
-        .and_then(|v| {
-            if let Some(n) = v.as_u64() {
-                Some(n)
-            } else if let Some(s) = v.as_str() {
-                chrono::DateTime::parse_from_rfc3339(s).ok()
-                    .map(|dt| dt.timestamp_millis() as u64)
-                    .or_else(|| s.parse::<u64>().ok())
-            } else {
-                None
-            }
-        });
-        
-    let step_count = obj.get("stepCount")
-        .or_else(|| obj.get("numSteps"))
-        .or_else(|| obj.get("totalSteps"))
-        .and_then(|v| v.as_u64().map(|n| n as u32));
-        
-    Some(TrajectorySummary {
-        session_id,
-        last_modified_ms,
-        step_count,
-    })
-}
-
-fn is_better_summary(next: &TrajectorySummary, current: &TrajectorySummary) -> bool {
-    let next_mod = next.last_modified_ms.unwrap_or(0);
-    let curr_mod = current.last_modified_ms.unwrap_or(0);
-    if next_mod != curr_mod {
-        return next_mod > curr_mod;
-    }
-    next.step_count.unwrap_or(0) > current.step_count.unwrap_or(0)
-}
 
 // ==========================================
 // 4. TrajectoryExporter
 // ==========================================
 pub struct TrajectoryExporter {
     config: MonitorConfig,
-    client: AntigravityRpcClient,
+    locator: ProcessLocator,
     cache_root: PathBuf,
 }
 
 impl TrajectoryExporter {
     pub fn new(config: MonitorConfig) -> Self {
-        let timeout_ms = config.rpc_timeout_ms;
         let debug = config.debug;
-        let cache_root = PathBuf::from(&config.session_root)
-            .join(".token-monitor")
+        let target_app_data_dir = PathBuf::from(&config.session_root)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("antigravity")
+            .to_string();
+            
+        let cache_root = dirs::home_dir()
+            .map(|h| h.join(".token-pulse").join("token-monitor"))
+            .unwrap_or_else(|| PathBuf::from(".token-pulse").join("token-monitor"))
+            .join(&target_app_data_dir)
             .join("rpc-cache")
             .join("v1");
             
         Self {
-            client: AntigravityRpcClient::new(timeout_ms, debug),
+            locator: ProcessLocator::new(debug),
             config,
             cache_root,
         }
@@ -634,27 +471,54 @@ impl TrajectoryExporter {
         
         let mut exported_count = 0;
         
-        let summaries = match self.fetch_summaries_with_retry().await {
-            Ok(s) => s,
-            Err(e) => {
-                println!("[RPC Exporter] Summary fetch failed: {}", e);
-                return Err(e);
+        let target_app_data_dir = PathBuf::from(&self.config.session_root)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("antigravity")
+            .to_string();
+
+        let process_candidates = self.locator.detect_processes(&target_app_data_dir);
+        let mut exe_path = None;
+        let mut ls_address = None;
+
+        if !process_candidates.is_empty() {
+            let candidate = &process_candidates[0];
+            if let Some(ref path) = candidate.executable_path {
+                exe_path = Some(path.clone());
             }
-        };
+            let ports = PortLocator::get_listening_ports(candidate.pid);
+            if !ports.is_empty() {
+                ls_address = Some(format!("127.0.0.1:{}", ports[0]));
+            }
+        }
+
+        let fallback_exe = dirs::home_dir()
+            .map(|h| h.join("AppData").join("Local").join("Programs").join("antigravity").join("resources").join("bin").join("language_server.exe"))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "language_server.exe".to_string());
+
+        let final_exe = exe_path.unwrap_or(fallback_exe);
+        let final_address = ls_address.or_else(|| {
+            std::env::var("ANTIGRAVITY_LS_ADDRESS").ok()
+        });
         
-        let summary_by_id: HashMap<String, TrajectorySummary> = summaries.into_iter()
-            .map(|s| (s.session_id.clone(), s))
-            .collect();
-            
         for candidate in candidates {
-            let summary = summary_by_id.get(&candidate.session_id).cloned();
-            let in_active_rpc = summary.is_some();
-            
-            if !in_active_rpc {
+            let transcript_path = PathBuf::from(&candidate.session_dir)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+
+            if !transcript_path.exists() {
                 continue;
             }
-            
-            let summary = summary.unwrap();
+
+            let mtime_ms = std::fs::metadata(&transcript_path)
+                .and_then(|m| m.modified())
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
             let previous = self.load_manifest(&candidate.session_id).ok();
             
             let should_force_this_session = force || (
@@ -664,82 +528,296 @@ impl TrajectoryExporter {
                 )
             );
             
-            let export_needed = should_export_session(&summary, previous.as_ref(), should_force_this_session);
+            let mut export_needed = should_force_this_session;
+            if let Some(ref prev) = previous {
+                if prev.server_last_modified_ms != Some(mtime_ms) {
+                    export_needed = true;
+                }
+            } else {
+                export_needed = true;
+            }
+
             if !export_needed {
                 continue;
             }
             
-            match self.fetch_session_payload_with_retry(&candidate.session_id).await {
-                Ok((steps, metadata)) => {
-                    let serialized_steps = if self.config.export_steps_jsonl {
-                        serialize_steps(&candidate.session_id, &steps)
+            let mut cmd = Command::new(&final_exe);
+            cmd.arg("agentapi")
+               .arg("get-conversation-metadata")
+               .arg(&candidate.session_id);
+
+            if let Some(ref addr) = final_address {
+                cmd.env("ANTIGRAVITY_LS_ADDRESS", addr);
+            }
+
+            let output = cmd.output();
+            let mut _created_at_str = None;
+            let mut _project_id = None;
+
+            match output {
+                Ok(out) => {
+                    if out.status.success() {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                            if let Some(m) = val.get("response")
+                                .and_then(|r| r.get("conversationMetadata"))
+                                .and_then(|c| c.get("metadata"))
+                            {
+                                _created_at_str = m.get("createdAt").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                _project_id = m.get("projectId").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            }
+                        }
                     } else {
-                        serialize_steps_redacted(&candidate.session_id, &steps)
-                    };
-                    
-                    let serialized_usage = serialize_usage(&candidate.session_id, &metadata);
-                    
-                    match self.write_session_artifacts(
-                        &candidate.session_id,
-                        summary.last_modified_ms,
-                        summary.step_count,
-                        serialized_steps,
-                        serialized_usage,
-                    ).await {
-                        Ok(_) => {
-                            exported_count += 1;
-                        }
-                        Err(e) => {
-                            let _ = self.record_failure(&candidate.session_id, &e.to_string()).await;
-                        }
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        tracing::debug!(
+                            session_id = ?candidate.session_id,
+                            exit_code = ?out.status.code(),
+                            stdout = ?stdout.trim(),
+                            stderr = ?stderr.trim(),
+                            "agentapi metadata check returned non-zero (expected fallback if session is archived/offline)"
+                        );
                     }
                 }
                 Err(e) => {
-                    let _ = self.record_failure(&candidate.session_id, &e).await;
+                    tracing::debug!(
+                        session_id = ?candidate.session_id,
+                        error = ?e,
+                        "failed to execute agentapi subprocess CLI (expected fallback to local transcript estimation)"
+                    );
+                }
+            }
+
+            let mut cumulative_chars = 0;
+            let mut chars_at_last_model = 0;
+
+            let file = match std::fs::File::open(&transcript_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = self.record_failure(&candidate.session_id, &e.to_string()).await;
+                    continue;
+                }
+            };
+            
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(file);
+            let mut new_values = Vec::new();
+            for line_res in reader.lines() {
+                if let Ok(line) = line_res {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        new_values.push(v);
+                    }
+                }
+            }
+
+            enum GroupedStep {
+                ModelGroup(Vec<serde_json::Value>),
+                Other(serde_json::Value),
+            }
+
+            let mut grouped_steps = Vec::new();
+            let mut current_group = Vec::new();
+
+            for val in new_values {
+                let source = val.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let has_usage = val.get("usage_metadata").filter(|v| !v.is_null()).is_some();
+                if source == "MODEL" || has_usage {
+                    current_group.push(val);
+                } else {
+                    if !current_group.is_empty() {
+                        grouped_steps.push(GroupedStep::ModelGroup(std::mem::take(&mut current_group)));
+                    }
+                    grouped_steps.push(GroupedStep::Other(val));
+                }
+            }
+            if !current_group.is_empty() {
+                grouped_steps.push(GroupedStep::ModelGroup(current_group));
+            }
+
+            let mut exported_steps = Vec::new();
+            let mut exported_usages = Vec::new();
+            let mut sequence = 0;
+
+            for step in grouped_steps {
+                match step {
+                    GroupedStep::Other(val) => {
+                        let content_str = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        let thinking_str = val.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                        cumulative_chars += content_str.len() + thinking_str.len();
+                        
+                        let role = if val.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") { "user" } else { "system" };
+                        let timestamp = extract_timestamp_val(&val);
+                        
+                        let text = content_str.to_string();
+                        let step_index = val.get("step_index").and_then(|v| v.as_i64()).unwrap_or(0) as usize;
+                        
+                        exported_steps.push(serde_json::json!({
+                            "recordType": "step",
+                            "sessionId": &candidate.session_id,
+                            "stepIndex": step_index,
+                            "role": role,
+                            "timestamp": timestamp,
+                            "model": serde_json::Value::Null,
+                            "text": text,
+                        }));
+                    }
+                    GroupedStep::ModelGroup(group) => {
+                        let mut group_content_len = 0;
+                        let mut group_thinking_len = 0;
+                        let mut stable_ts = None;
+                        let mut step_idx = 0;
+                        let mut model_raw = "gemini-3.5-flash".to_string();
+                        let mut is_official = false;
+
+                        let mut official_input = None;
+                        let mut official_output = None;
+                        let mut official_cache = None;
+                        let mut official_reasoning = None;
+
+                        for val in &group {
+                            let content_str = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let thinking_str = val.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                            group_content_len += content_str.len();
+                            group_thinking_len += thinking_str.len();
+
+                            if step_idx == 0 {
+                                step_idx = val.get("step_index").and_then(|v| v.as_i64()).unwrap_or(0);
+                            }
+
+                            if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
+                                model_raw = m.to_string();
+                            }
+
+                            if let Some(usage) = val.get("usage_metadata").filter(|v| !v.is_null()) {
+                                official_input = usage.get("prompt_token_count").and_then(|v| v.as_u64());
+                                official_output = usage.get("candidates_token_count").and_then(|v| v.as_u64());
+                                official_cache = usage.get("cached_content_token_count").and_then(|v| v.as_u64());
+                                official_reasoning = usage.get("thoughts_token_count").and_then(|v| v.as_u64());
+                                is_official = true;
+                            }
+
+                            if stable_ts.is_none() {
+                                stable_ts = extract_timestamp_val(val);
+                            }
+                        }
+
+                        let input;
+                        let output;
+                        let cache;
+                        let reasoning;
+
+                        if let (Some(inp), Some(out)) = (official_input, official_output) {
+                            input = inp;
+                            output = out;
+                            cache = official_cache.unwrap_or(0);
+                            reasoning = official_reasoning.unwrap_or(0);
+                        } else {
+                            output = ((group_content_len as f64) * 0.35).round() as u64;
+                            reasoning = ((group_thinking_len as f64) * 0.35).round() as u64;
+
+                            // Gemini API 每次调用发送完整上下文窗口（所有历史消息）作为 prompt
+                            // 因此 input ≈ 累计字符数 * token/char 比率 + 基础系统指令开销
+                            let full_context_tokens = 500 + ((cumulative_chars as f64) * 0.35).round() as u64;
+                            input = full_context_tokens;
+                            // 估算 cache: 之前已发送过的上下文部分可能命中缓存
+                            let prev_context_tokens = ((chars_at_last_model as f64) * 0.35).round() as u64;
+                            cache = prev_context_tokens;
+                        }
+
+                        let timestamp = stable_ts.unwrap_or(0);
+
+                        exported_steps.push(serde_json::json!({
+                            "recordType": "step",
+                            "sessionId": &candidate.session_id,
+                            "stepIndex": step_idx as usize,
+                            "role": "model",
+                            "timestamp": timestamp,
+                            "model": &model_raw,
+                            "text": String::new(),
+                        }));
+
+                        let mut raw_val = serde_json::json!({
+                            "chatModel": {
+                                "model": &model_raw,
+                                "usage": {
+                                    "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+                                    "inputTokens": input.to_string(),
+                                    "model": &model_raw,
+                                    "outputTokens": output.to_string(),
+                                    "thinkingOutputTokens": reasoning.to_string(),
+                                }
+                            }
+                        });
+
+                        if is_official {
+                            if let Some(obj) = raw_val.get_mut("chatModel").and_then(|m| m.as_object_mut()) {
+                                obj.insert("usage_metadata".to_string(), serde_json::json!({
+                                    "prompt_token_count": input,
+                                    "candidates_token_count": output,
+                                    "cached_content_token_count": cache,
+                                    "thoughts_token_count": reasoning,
+                                }));
+                            }
+                        }
+
+                        let resolved_model_name = resolve_model(&model_raw);
+
+                        exported_usages.push(serde_json::json!({
+                            "recordType": "usage",
+                            "sessionId": &candidate.session_id,
+                            "sequence": sequence,
+                            "stepIndex": step_idx,
+                            "timestamp": timestamp,
+                            "model": resolved_model_name,
+                            "inputTokens": input,
+                            "outputTokens": output,
+                            "cacheReadTokens": cache,
+                            "cacheWriteTokens": 0,
+                            "reasoningTokens": reasoning,
+                            "totalTokens": input + output + reasoning,
+                            "raw": raw_val,
+                        }));
+
+                        sequence += 1;
+                        cumulative_chars += group_content_len + group_thinking_len;
+                        chars_at_last_model = cumulative_chars;
+                    }
+                }
+            }
+
+            let exported_steps_len = exported_steps.len();
+            let serialized_steps = if self.config.export_steps_jsonl {
+                Some(exported_steps)
+            } else {
+                let mut redacted = Vec::new();
+                for mut s in exported_steps {
+                    if let Some(obj) = s.as_object_mut() {
+                        obj.insert("text".to_string(), serde_json::Value::String(String::new()));
+                    }
+                    redacted.push(s);
+                }
+                Some(redacted)
+            };
+
+            match self.write_session_artifacts(
+                &candidate.session_id,
+                Some(mtime_ms),
+                Some(exported_steps_len as u32),
+                serialized_steps,
+                exported_usages,
+            ).await {
+                Ok(_) => {
+                    exported_count += 1;
+                }
+                Err(e) => {
+                    let _ = self.record_failure(&candidate.session_id, &e.to_string()).await;
                 }
             }
         }
         
         Ok(exported_count)
-    }
-
-    async fn fetch_summaries_with_retry(&self) -> Result<Vec<TrajectorySummary>, String> {
-        let max_attempts = 2;
-        let mut last_err = String::new();
-        
-        for attempt in 1..=max_attempts {
-            self.client.flush().await;
-            match self.client.list_trajectories().await {
-                Ok(summaries) => return Ok(summaries),
-                Err(e) => {
-                    last_err = e;
-                    if attempt < max_attempts {
-                        self.client.reset_connection().await;
-                    }
-                }
-            }
-        }
-        Err(last_err)
-    }
-
-    async fn fetch_session_payload_with_retry(&self, session_id: &str) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
-        let max_attempts = 2;
-        let mut last_err = String::new();
-        
-        for attempt in 1..=max_attempts {
-            let steps = self.client.get_trajectory_steps(session_id).await;
-            let metadata = self.client.get_trajectory_metadata(session_id).await;
-            
-            if !steps.is_empty() || !metadata.is_empty() {
-                return Ok((steps, metadata));
-            } else {
-                last_err = "Empty payload".to_string();
-                if attempt < max_attempts {
-                    self.client.reset_connection().await;
-                }
-            }
-        }
-        Err(last_err)
     }
 
     async fn write_session_artifacts(
@@ -759,7 +837,7 @@ impl TrajectoryExporter {
         };
         let usage_content = to_jsonl(&usage);
         
-        use sha1::{Sha1, Digest};
+        use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
         hasher.update(session_id.as_bytes());
         hasher.update(b"\0");
@@ -815,24 +893,6 @@ impl TrajectoryExporter {
     }
 }
 
-fn should_export_session(
-    summary: &TrajectorySummary,
-    previous: Option<&RpcArtifactManifest>,
-    force: bool,
-) -> bool {
-    if force {
-        return true;
-    }
-    let prev = match previous {
-        None => return true,
-        Some(p) => p,
-    };
-    if prev.artifact_hash.is_empty() {
-        return true;
-    }
-    prev.server_last_modified_ms != summary.last_modified_ms || prev.step_count != summary.step_count
-}
-
 fn to_jsonl(records: &[serde_json::Value]) -> String {
     if records.is_empty() {
         return String::new();
@@ -857,309 +917,39 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// ==========================================
-// 5. Internal Serialization Helpers
-// ==========================================
-#[derive(Debug, Clone, Default)]
-struct ExtractedUsage {
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    reasoning_tokens: u64,
-    total_tokens: u64,
-}
-
-fn extract_usage(value: &serde_json::Value) -> ExtractedUsage {
-    let mut usage = ExtractedUsage::default();
-    
-    fn visit(val: &serde_json::Value, usage: &mut ExtractedUsage) {
-        if let Some(arr) = val.as_array() {
-            for item in arr {
-                visit(item, usage);
-            }
-        } else if let Some(obj) = val.as_object() {
-            for (key, child) in obj {
-                let normalized_key = key.to_lowercase();
-                if let Some(num) = to_finite_number(child) {
-                    if normalized_key.starts_with("input") && normalized_key.contains("token")
-                        || normalized_key.starts_with("prompt") && normalized_key.contains("token")
-                    {
-                        usage.input_tokens += num;
-                    } else if normalized_key.starts_with("output") && normalized_key.contains("token")
-                        || normalized_key.starts_with("completion") && normalized_key.contains("token")
-                    {
-                        usage.output_tokens += num;
-                    } else if normalized_key.contains("cache") && normalized_key.contains("read") && normalized_key.contains("token") {
-                        usage.cache_read_tokens += num;
-                    } else if normalized_key.contains("cache") && normalized_key.contains("write") && normalized_key.contains("token") {
-                        usage.cache_write_tokens += num;
-                    } else if (normalized_key.contains("reasoning") || normalized_key.contains("thinking")) && normalized_key.contains("token") {
-                        usage.reasoning_tokens += num;
-                    } else if normalized_key == "totaltokens" || normalized_key == "total_tokens" {
-                        usage.total_tokens += num;
-                    }
-                }
-                visit(child, usage);
-            }
-        }
-    }
-    
-    visit(value, &mut usage);
-    
-    let sum = usage.input_tokens + usage.output_tokens + usage.cache_read_tokens + usage.cache_write_tokens + usage.reasoning_tokens;
-    usage.total_tokens = usage.total_tokens.max(sum);
-    usage
-}
-
-fn to_finite_number(value: &serde_json::Value) -> Option<u64> {
-    if let Some(n) = value.as_u64() {
-        Some(n)
-    } else if let Some(f) = value.as_f64() {
-        Some(f as u64)
-    } else if let Some(s) = value.as_str() {
-        s.parse::<u64>().ok()
-    } else {
-        None
-    }
-}
-
-fn extract_role(value: &serde_json::Value) -> String {
-    if let Some(obj) = value.as_object() {
-        if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
-            if t == "CORTEX_STEP_TYPE_USER_INPUT" {
-                return "user".to_string();
-            }
-            if t == "CORTEX_STEP_TYPE_MODEL_RESPONSE" || t == "CORTEX_STEP_TYPE_PLANNER_RESPONSE" {
-                return "model".to_string();
-            }
-        }
-        if let Some(header) = obj.get("header").and_then(|h| h.as_object()) {
-            if let Some(sender) = header.get("sender").and_then(|s| s.as_str()) {
-                return if sender == "USER" { "user".to_string() } else { "model".to_string() };
-            }
-        }
-    }
-    "unknown".to_string()
-}
-
-fn extract_timestamp(value: &serde_json::Value) -> Option<u64> {
-    let obj = value.as_object()?;
-    for key in &["timestamp", "createdAt", "lastModifiedTime"] {
-        if let Some(v) = obj.get(*key) {
-            if let Some(n) = v.as_u64() {
-                return Some(n);
-            } else if let Some(s) = v.as_str() {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(s) {
-                    return Some(parsed.timestamp_millis() as u64);
-                }
-                if let Ok(n) = s.parse::<u64>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn extract_model(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    obj.get("model")
-        .or_else(|| obj.get("modelId"))
-        .or_else(|| obj.get("modelName"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn extract_step_text(value: &serde_json::Value) -> String {
-    let obj = match value.as_object() {
-        None => return String::new(),
-        Some(o) => o,
-    };
-    
-    if let Some(user_input) = obj.get("userInput").and_then(|u| u.as_object()) {
-        if let Some(user_resp) = user_input.get("userResponse").and_then(|r| r.as_str()) {
-            if !user_resp.trim().is_empty() {
-                return user_resp.to_string();
-            }
-        }
-        if let Some(items) = user_input.get("items").and_then(|i| i.as_array()) {
-            let mut parts = Vec::new();
-            for item in items {
-                if let Some(item_obj) = item.as_object() {
-                    if let Some(text_val) = item_obj.get("text").and_then(|t| t.as_object()) {
-                        if let Some(content) = text_val.get("content").and_then(|c| c.as_str()) {
-                            parts.push(content.to_string());
-                        }
-                    }
-                    if let Some(code_val) = item_obj.get("code").and_then(|c| c.as_object()) {
-                        if let Some(val_str) = code_val.get("value").and_then(|v| v.as_str()) {
-                            parts.push(val_str.to_string());
-                        }
-                    }
-                }
-            }
-            if !parts.is_empty() {
-                return parts.join("\n\n");
-            }
-        }
-    }
-    
-    if let Some(model_resp) = obj.get("modelResponse").and_then(|m| m.as_object()) {
-        if let Some(content) = model_resp.get("content").and_then(|c| c.as_array()) {
-            let mut parts = Vec::new();
-            for item in content {
-                if let Some(part_obj) = item.as_object() {
-                    if let Some(text_val) = part_obj.get("text").and_then(|t| t.as_object()) {
-                        if let Some(content_str) = text_val.get("content").and_then(|c| c.as_str()) {
-                            if !content_str.is_empty() {
-                                parts.push(content_str.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            if !parts.is_empty() {
-                return parts.join("\n");
-            }
-        }
-        if let Some(text_str) = model_resp.get("text").and_then(|t| t.as_str()) {
-            return text_str.to_string();
-        }
-    }
-    
-    if let Some(planner_resp) = obj.get("plannerResponse").and_then(|p| p.as_object()) {
-        if let Some(thinking) = planner_resp.get("thinking").and_then(|t| t.as_str()) {
-            return thinking.to_string();
-        }
-    }
-    
-    if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
-        if !text.trim().is_empty() {
-            return text.to_string();
-        }
-    }
-    
-    if let Some(message) = obj.get("message").and_then(|m| m.as_object()) {
-        if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
-            if !text.trim().is_empty() {
-                return text.to_string();
-            }
-        }
-    }
-    
-    String::new()
-}
-
-fn extract_usage_model(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    
-    let candidates = vec![
-        obj.get("responseModel").and_then(|v| v.as_str()),
-        obj.get("model").and_then(|v| v.as_str()),
-        obj.get("modelName").and_then(|v| v.as_str()),
-        obj.get("modelId").and_then(|v| v.as_str()),
+fn extract_timestamp_val(val: &serde_json::Value) -> Option<i64> {
+    let ts_paths = [
+        val.get("timestamp"),
+        val.get("created_at"),
+        val.get("createdAt"),
     ];
-    
-    if let Some(direct) = preferred_model_from_opts(&candidates, None) {
-        return Some(direct);
-    }
-    
-    if let Some(chat_model) = obj.get("chatModel").and_then(|c| c.as_object()) {
-        let chat_candidates = vec![
-            chat_model.get("responseModel").and_then(|v| v.as_str()),
-            chat_model.get("model").and_then(|v| v.as_str()),
-            chat_model.get("modelName").and_then(|v| v.as_str()),
-            chat_model.get("modelId").and_then(|v| v.as_str()),
-        ];
-        if let Some(from_chat) = preferred_model_from_opts(&chat_candidates, None) {
-            return Some(from_chat);
+    for val_ts in ts_paths.into_iter().flatten() {
+        if val_ts.is_null() { continue; }
+        if let Some(n) = val_ts.as_i64() {
+            return Some(n);
         }
-        
-        if let Some(usage) = chat_model.get("usage").and_then(|u| u.as_object()) {
-            let usage_candidates = vec![
-                usage.get("responseModel").and_then(|v| v.as_str()),
-                usage.get("model").and_then(|v| v.as_str()),
-                usage.get("modelName").and_then(|v| v.as_str()),
-                usage.get("modelId").and_then(|v| v.as_str()),
-            ];
-            if let Some(from_usage) = preferred_model_from_opts(&usage_candidates, None) {
-                return Some(from_usage);
+        if let Some(s) = val_ts.as_str() {
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return Some(dt.timestamp_millis());
             }
         }
     }
-    
     None
 }
 
-fn preferred_model_from_opts(candidates: &[Option<&str>], inherited: Option<&str>) -> Option<String> {
-    crate::model_aliases::preferred_model(candidates, inherited)
-}
-
-fn serialize_steps(session_id: &str, steps: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
-    let mut out = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        let text = extract_step_text(step);
-        out.push(serde_json::json!({
-            "recordType": "step",
-            "sessionId": session_id,
-            "stepIndex": index,
-            "role": extract_role(step),
-            "timestamp": extract_timestamp(step),
-            "model": extract_model(step),
-            "text": text,
-        }));
+fn resolve_model(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "unknown".to_string();
     }
-    Some(out)
-}
-
-fn serialize_steps_redacted(session_id: &str, steps: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
-    let mut out = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        let usage = extract_usage(step);
-        let mut obj = serde_json::json!({
-            "recordType": "step",
-            "sessionId": session_id,
-            "stepIndex": index,
-            "role": extract_role(step),
-            "timestamp": extract_timestamp(step),
-            "model": extract_model(step),
-        });
-        
-        if usage.total_tokens > 0 {
-            if let Some(map) = obj.as_object_mut() {
-                map.insert("inputTokens".to_string(), serde_json::Value::Number(usage.input_tokens.into()));
-                map.insert("outputTokens".to_string(), serde_json::Value::Number(usage.output_tokens.into()));
-                map.insert("cacheReadTokens".to_string(), serde_json::Value::Number(usage.cache_read_tokens.into()));
-                map.insert("cacheWriteTokens".to_string(), serde_json::Value::Number(usage.cache_write_tokens.into()));
-                map.insert("reasoningTokens".to_string(), serde_json::Value::Number(usage.reasoning_tokens.into()));
-                map.insert("totalTokens".to_string(), serde_json::Value::Number(usage.total_tokens.into()));
-            }
-        }
-        
-        out.push(obj);
+    if let Some(resolved) = crate::model_aliases::resolve_model_placeholder(raw) {
+        return resolved.to_string();
     }
-    Some(out)
-}
-
-fn serialize_usage(session_id: &str, metadata: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for (index, entry) in metadata.iter().enumerate() {
-        let usage = extract_usage(entry);
-        out.push(serde_json::json!({
-            "recordType": "usage",
-            "sessionId": session_id,
-            "sequence": index,
-            "timestamp": extract_timestamp(entry),
-            "model": extract_usage_model(entry),
-            "inputTokens": usage.input_tokens,
-            "outputTokens": usage.output_tokens,
-            "cacheReadTokens": usage.cache_read_tokens,
-            "cacheWriteTokens": usage.cache_write_tokens,
-            "reasoningTokens": usage.reasoning_tokens,
-            "totalTokens": usage.total_tokens,
-            "raw": entry,
-        }));
+    if raw.starts_with("MODEL_PLACEHOLDER_") {
+        return "unknown".to_string();
     }
-    out
+    raw.to_string()
 }

@@ -3,7 +3,7 @@
 //! 针对每个接入的采集器 (Antigravity, Claude Code, Codex)，展示其配置与实时采集统计。
 
 use xilem::masonry::properties::types::{AsUnit, CrossAxisAlignment};
-use xilem::view::{flex_col, flex_row, label, sized_box, FlexSpacer};
+use xilem::view::{flex_col, flex_row, label, sized_box, FlexSpacer, prose};
 use xilem::style::Style;
 use xilem::{Color, WidgetView};
 
@@ -76,7 +76,7 @@ pub fn collector_card<State: 'static>(
                 sized_box(label("PATH").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED))
                     .width(45.0_f32.px()),
                 FlexSpacer::Fixed(6.0_f32.px()),
-                label(path_str).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_PRIMARY),
+                prose(path_str).text_size(theme::FONT_SIZE_SMALL).text_color(theme::TEXT_PRIMARY),
             ))
             .cross_axis_alignment(CrossAxisAlignment::Center),
             
@@ -87,7 +87,7 @@ pub fn collector_card<State: 'static>(
                 sized_box(label("STATS").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED))
                     .width(45.0_f32.px()),
                 FlexSpacer::Fixed(6.0_f32.px()),
-                label(stats_str).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_PRIMARY),
+                prose(stats_str).text_size(theme::FONT_SIZE_SMALL).text_color(theme::TEXT_PRIMARY),
             ))
             .cross_axis_alignment(CrossAxisAlignment::Center),
             
@@ -98,7 +98,7 @@ pub fn collector_card<State: 'static>(
                 sized_box(label("COST").text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_MUTED))
                     .width(45.0_f32.px()),
                 FlexSpacer::Fixed(6.0_f32.px()),
-                label(cost_str).text_size(theme::FONT_SIZE_SMALL).color(theme::TEXT_CYAN),
+                prose(cost_str).text_size(theme::FONT_SIZE_SMALL).text_color(theme::TEXT_CYAN),
             ))
             .cross_axis_alignment(CrossAxisAlignment::Center),
         ))
