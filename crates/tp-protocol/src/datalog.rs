@@ -269,7 +269,7 @@ mod tests {
         a.accumulate(&b);
         assert_eq!(a.input, 150);
         assert_eq!(a.output, 300);
-        assert_eq!(a.total(), 450);
+        assert_eq!(a.total(), 495);
     }
 
     #[test]

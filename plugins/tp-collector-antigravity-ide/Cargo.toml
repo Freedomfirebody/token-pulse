@@ -1,5 +1,5 @@
 [package]
-name = "tp-collector-antigravity"
+name = "tp-collector-antigravity-ide"
 version.workspace = true
 edition.workspace = true
 
@@ -13,5 +13,5 @@ chrono.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-parking_lot.workspace = true
 dirs.workspace = true
+parking_lot.workspace = true

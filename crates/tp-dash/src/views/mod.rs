@@ -4,6 +4,7 @@ pub mod metric_card;
 pub mod panel;
 pub mod bar_chart;
 pub mod heatmap;
+pub mod weekly_chart;
 pub mod sparkline;
 pub mod tabs;
 pub mod breakdown;
@@ -12,4 +13,5 @@ pub mod collector_card;
 pub mod by_model;
 
 pub use by_model::{PrecalculatedModelUsage, by_model_view};
+
 

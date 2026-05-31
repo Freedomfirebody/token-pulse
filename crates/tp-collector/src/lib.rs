@@ -100,10 +100,20 @@ impl CollectorCoordinator {
                 let source_name = source.name();
                 let mut last_collected: Option<DateTime<Utc>> = None;
 
-                // 延迟 3 秒执行首次采集，让 UI 先顺利渲染显示，彻底消除启动时的 CPU/IO 争抢
+                // 延迟 3 秒执行首次采集，让 UI 先顺利渲染显示
+                // 同时监听 cmd_rx，确保启动期间收到的 Rebuild/Upsert 不丢失
+                let mut startup_cmd_pending = false;
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(3)) => {
-                        let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    cmd = cmd_rx.recv() => {
+                        match cmd {
+                            Ok(CollectorCommand::TriggerUpsert | CollectorCommand::TriggerRebuild) => {
+                                info!(source = %source_name, "启动延迟期间收到重建命令，立即执行");
+                                last_collected = None;
+                                startup_cmd_pending = true;
+                            }
+                            _ => {}
+                        }
                     }
                     res = shutdown.changed() => {
                         if res.is_ok() && *shutdown.borrow() {
@@ -112,6 +122,10 @@ impl CollectorCoordinator {
                         }
                     }
                 }
+
+                // 首次采集（或启动期间收到的 Rebuild）
+                let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                let _ = startup_cmd_pending; // 已通过上面的 collect 执行
 
                 loop {
                     tokio::select! {
@@ -123,7 +137,7 @@ impl CollectorCoordinator {
                                 Ok(command) => {
                                     match command {
                                         CollectorCommand::TriggerUpsert | CollectorCommand::TriggerRebuild => {
-                                            tracing::info!(source = %source_name, "强制重置拉取被触发 (重置采集截止点为 0)");
+                                            info!(source = %source_name, "强制重置拉取被触发 (重置采集截止点为 0)");
                                             last_collected = None;
                                             let _ = collect_and_push(&source, &tx, &mut last_collected).await;
                                         }
@@ -134,7 +148,12 @@ impl CollectorCoordinator {
                                     info!(source = %source_name, "采集器命令通道关闭，停止采集器");
                                     break;
                                 }
-                                Err(_) => {} // Lagged, 忽略继续
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    // 因 collect 阻塞导致命令堆积溢出 — 补偿执行全量采集
+                                    warn!(source = %source_name, lagged = n, "命令积压溢出，补偿执行全量采集");
+                                    last_collected = None;
+                                    let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                                }
                             }
                         }
                         _ = shutdown.changed() => {
@@ -320,10 +339,10 @@ mod tests {
             coordinator.run_streaming(Duration::from_millis(50), cmd_tx, shutdown_rx).await;
         });
 
-        // 收集首批数据 (3 个源各自立即采集一次)
+        // 收集首批数据 (3 个源各自立即采集一次，由于启动延迟有 3 秒，因此测试等待超时需要设为 5 秒)
         let mut received_projects: Vec<String> = Vec::new();
         for _ in 0..3 {
-            let batch = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            let batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("等待数据超时")
                 .expect("channel 关闭");
@@ -346,7 +365,7 @@ mod tests {
 
         // 停止
         let _ = shutdown_tx.send(true);
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// 数据完整性: 采集到的数据内容不变

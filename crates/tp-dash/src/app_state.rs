@@ -21,7 +21,7 @@ use crate::views::panel::panel_container;
 use crate::widgets::portal::vertical_portal;
 
 // 导入高解耦的封装组件状态与数据结构
-use crate::views::heatmap::HeatmapComponent;
+use crate::views::weekly_chart::weekly_chart_view;
 use crate::views::breakdown::BreakdownComponent;
 use crate::views::session_table::SessionTableComponent;
 use crate::views::collector_card::{CollectorCardData, collector_card};
@@ -73,7 +73,6 @@ pub struct AppState {
     pub view_rx: Option<tokio::sync::watch::Receiver<DashboardView>>,
 
     // ===== 高内聚封装组件挂载 =====
-    pub heatmap: HeatmapComponent,
     pub breakdown: BreakdownComponent,
     pub session_table: SessionTableComponent,
     
@@ -107,7 +106,6 @@ impl AppState {
             active_tab: DashTab::All,
             refresh_tx: None,
             view_rx: None,
-            heatmap: HeatmapComponent::new(),
             breakdown: BreakdownComponent::new(),
             session_table: SessionTableComponent::new(),
             collectors_data: Vec::new(),
@@ -372,7 +370,6 @@ fn precalculate(state: &mut AppState) {
     }).collect();
 
     // 2. 调度各封装组件更新其内部私有资产
-    state.heatmap.update(view);
     state.breakdown.update(view);
     state.session_table.update(view);
 
@@ -709,11 +706,8 @@ fn single_part_1(state: &mut AppState) -> impl WidgetView<AppState> {
 
 fn single_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
     flex_col((
-        // Heatmap Component (map_state)
-        xilem::core::map_state(
-            state.heatmap.view(&state.worker_tx),
-            |state: &mut AppState| &mut state.heatmap,
-        ),
+        // Weekly Chart Component
+        weekly_chart_view(&state.view),
         
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         flex_row((
@@ -838,12 +832,9 @@ fn dual_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
 
     flex_col((
         flex_row((
-            // Left column: Heatmap (Adapt) + Model Usage
+            // Left column: Weekly Chart + Model Usage
             flex_col((
-                xilem::core::map_state(
-                    state.heatmap.view(&state.worker_tx),
-                    |state: &mut AppState| &mut state.heatmap,
-                ),
+                weekly_chart_view(&state.view),
                 FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
                 by_model_dual,
             ))
@@ -1060,9 +1051,11 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                             }
                             msg = rx_worker.recv() => {
                                 if let Some(WorkerMessage::ClosePopupDelay) = msg {
+                                    tracing::info!("Worker received ClosePopupDelay, spawning 150ms sleep task");
                                     let proxy = proxy.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                        tracing::info!("Worker sleep finished, sending AppEvent::ClosePopup");
                                         let _ = proxy.message(AppEvent::ClosePopup);
                                     });
                                 } else {
@@ -1082,12 +1075,7 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
                         state.update_view(view);
                     }
                     AppEvent::ClosePopup => {
-                        // 局部 UI 弹出层彻底重置
-                        if !state.heatmap.ui.cell_hovered && !state.heatmap.ui.popup_hovered {
-                            state.heatmap.ui.hovered_cell = None;
-                            state.heatmap.ui.popup_hovered = false;
-                            state.heatmap.ui.cell_hovered = false;
-                        }
+                        tracing::info!("AppEvent::ClosePopup received, ignoring since heatmap is removed");
                     }
                 }
             }

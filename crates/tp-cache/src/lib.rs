@@ -140,7 +140,8 @@ impl DataCache {
             .indices
             .iter()
             .filter(|(_, idx)| {
-                idx.tier == tp_protocol::PartitionTier::ArchiveDaily
+                idx.tier == tp_protocol::PartitionTier::Active
+                    || idx.tier == tp_protocol::PartitionTier::ArchiveDaily
                     || idx.tier == tp_protocol::PartitionTier::ArchiveMonthly
             })
             .map(|(key, _)| key.clone())

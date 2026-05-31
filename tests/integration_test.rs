@@ -255,10 +255,10 @@ async fn test_full_pipeline_mock_datasources() {
     cache.build().await.unwrap();
     println!("✅ Cache built successfully");
 
-    // 8. 验证 Cache 快照 (根据架构设计，Cache 仅包含已归档的冷数据，故对纯 Active 的热数据应该为 0)
+    // 8. 验证 Cache 快照 (根据新的架构设计，Cache 包含 Active 及 Archive 分区的所有数据)
     let snapshot = cache.get_snapshot().await.unwrap();
-    assert_eq!(snapshot.total_tokens.total(), 0, "Cache snapshot should be 0 for purely active hot data");
-    println!("✅ Cache snapshot correctly empty for purely active data: total_tokens={}", snapshot.total_tokens.total());
+    assert_eq!(snapshot.total_tokens.total(), 293000, "Cache snapshot should contain active hot data");
+    println!("✅ Cache snapshot correctly populated for active data: total_tokens={}", snapshot.total_tokens.total());
 
     // 9. 初始化 Aggregator
     let aggregator = Arc::new(tp_aggregator::DataShow::new(
@@ -303,13 +303,13 @@ async fn test_historical_data_triggers_cache_rebuild() {
     pool_storage.push_datalogs(today_data).await.unwrap();
     println!("✅ Today's data pushed");
 
-    // 2. 构建 cache (此时全是 Active，故 cache 为 0)
+    // 2. 构建 cache (根据新的架构设计，此时包含已有的 Active 数据)
     let cache = Arc::new(tp_cache::DataCache::new(pool_storage.clone()));
     cache.build().await.unwrap();
     let initial_snapshot = cache.get_snapshot().await.unwrap();
     let initial_total = initial_snapshot.total_tokens.total();
-    assert_eq!(initial_total, 0);
-    println!("✅ Initial cache total: {}", initial_total);
+    assert_eq!(initial_total, 117000);
+    println!("✅ Initial cache total with active data: {}", initial_total);
 
     // 3. 推送昨天的历史数据
     let yesterday_data = mock_historical_data_yesterday();
@@ -425,3 +425,4 @@ async fn test_replace_or_push_rules() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+

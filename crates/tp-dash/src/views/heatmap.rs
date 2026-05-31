@@ -7,6 +7,7 @@ use xilem::view::{flex_col, flex_row, label, sized_box, FlexSpacer};
 use xilem::{Color, WidgetView};
 
 use crate::theme;
+use tracing::{info, trace};
 
 use xilem::masonry::accesskit::{Node, Role};
 use xilem::masonry::core::{
@@ -160,6 +161,14 @@ impl HeatmapComponent {
             ui.clone(),
             data.clone(),
             move |comp: &mut Self, cell, hovered| {
+                info!(
+                    cell = ?cell,
+                    hovered,
+                    cell_hovered = comp.ui.cell_hovered,
+                    popup_hovered = comp.ui.popup_hovered,
+                    hovered_cell = ?comp.ui.hovered_cell,
+                    "HeatmapComponent cell hover callback"
+                );
                 comp.ui.cell_hovered = hovered;
                 if hovered {
                     comp.ui.popup_hovered = false;
@@ -169,24 +178,31 @@ impl HeatmapComponent {
                         .and_then(|s| s.as_ref())
                         .is_some();
                     if has_stats {
+                        info!("HeatmapComponent hovered cell verified with stats: {:?}", cell);
                         comp.ui.hovered_cell = Some(cell);
                     } else {
+                        info!("HeatmapComponent hovered cell has no stats, ignored");
                         comp.ui.hovered_cell = None;
                         comp.ui.popup_hovered = false;
                     }
                 } else {
+                    info!("HeatmapComponent cell hover cleared, popup_hovered={}", comp.ui.popup_hovered);
                     if !comp.ui.popup_hovered {
                         if let Some(ref tx) = worker_tx_clone {
+                            info!("HeatmapComponent triggering ClosePopupDelay from cell hover off");
                             let _ = tx.send(crate::app_state::WorkerMessage::ClosePopupDelay);
                         }
                     }
                 }
             },
             move |comp: &mut Self, grid_hovered| {
+                info!("HeatmapComponent grid hover callback: grid_hovered={}", grid_hovered);
                 if !grid_hovered {
                     comp.ui.cell_hovered = false;
+                    info!("HeatmapComponent grid hover off, cell_hovered cleared, popup_hovered={}", comp.ui.popup_hovered);
                     if !comp.ui.popup_hovered {
                         if let Some(ref tx) = worker_tx_clone2 {
+                            info!("HeatmapComponent triggering ClosePopupDelay from grid hover off");
                             let _ = tx.send(crate::app_state::WorkerMessage::ClosePopupDelay);
                         }
                     }
@@ -222,21 +238,11 @@ impl HeatmapComponent {
         }
 
         let tooltip = build_custom_tooltip(stats_opt);
-        let worker_tx_clone3 = worker_tx.clone();
-
-        let hoverable_tooltip = crate::widgets::hoverable(tooltip, move |comp: &mut Self, hovered| {
-            comp.ui.popup_hovered = hovered;
-            if !hovered && !comp.ui.cell_hovered {
-                if let Some(ref tx) = worker_tx_clone3 {
-                    let _ = tx.send(crate::app_state::WorkerMessage::ClosePopupDelay);
-                }
-            }
-        });
 
         // 4. 使用 popover_stack 实现完美的悬浮对齐层级表现 (包裹 heatmap_grid)
         let grid_with_popover = crate::widgets::popover_stack(
             heatmap_grid,
-            hoverable_tooltip,
+            tooltip,
             crate::widgets::PopoverConfig {
                 anchor_point,
                 popover_align: crate::widgets::PopoverAlign::TopLeft,
@@ -476,39 +482,49 @@ impl Widget for HeatmapGridWidget {
         event: &PointerEvent,
     ) {
         let is_hovered = ctx.is_hovered();
+        trace!("HeatmapGridWidget on_pointer_event: event={:?}, is_hovered={}", event, is_hovered);
 
         if is_hovered && !self.grid_hovered {
+            info!("HeatmapGridWidget: grid entered hover state");
             self.grid_hovered = true;
             ctx.submit_action::<HeatmapGridAction>(HeatmapGridAction::GridHover(true));
         }
 
-        let mut new_hovered_cell = None;
-        if is_hovered {
-            let mut pos_opt = None;
-            match event {
-                PointerEvent::Move(update) => {
-                    pos_opt = Some(update.current.logical_point());
-                }
-                _ => {}
-            }
+        // 仅在 Move 事件时更新 hovered cell，避免 in stationary 或其他类型事件中被意外清除
+        let mut new_hovered_cell = self.hovered_cell;
+        let mut position_changed = false;
 
-            if let Some(pos) = pos_opt {
+        if is_hovered {
+            if let PointerEvent::Move(update) = event {
+                let pos = update.current.logical_point();
                 let col_step = 28.0;
                 let cell_box_size = 24.0;
                 let c = (pos.x / col_step).floor() as i32;
                 let r = (pos.y / col_step).floor() as i32;
 
-                if c >= 0 && c < 13 && r >= 0 && r < 7 {
+                trace!("HeatmapGridWidget PointerMove: pos={:?}, grid_col={}, grid_row={}", pos, c, r);
+
+                let mut cell_found = false;
+                if c >= 0 && c < 13 && r >= 7 || r >= 0 && r < 7 { // Simple bounds check
                     let x_in_cell = pos.x - (c as f64 * col_step);
                     let y_in_cell = pos.y - (r as f64 * col_step);
-                    if x_in_cell >= 0.0 && x_in_cell <= cell_box_size && y_in_cell >= 0.0 && y_in_cell <= cell_box_size {
+                    if c >= 0 && c < 13 && r >= 0 && r < 7 && x_in_cell >= 0.0 && x_in_cell <= cell_box_size && y_in_cell >= 0.0 && y_in_cell <= cell_box_size {
                         new_hovered_cell = Some((c as usize, r as usize));
+                        cell_found = true;
+                        trace!("HeatmapGridWidget cell matched: ({}, {})", c, r);
                     }
                 }
+
+                if !cell_found {
+                    trace!("HeatmapGridWidget cell not matched (pointer is in gap)");
+                    new_hovered_cell = None;
+                }
+                position_changed = true;
             }
         }
 
-        if new_hovered_cell != self.hovered_cell {
+        if position_changed && new_hovered_cell != self.hovered_cell {
+            info!("HeatmapGridWidget hovered cell changed: prev={:?}, new={:?}", self.hovered_cell, new_hovered_cell);
             self.hovered_cell = new_hovered_cell;
             ctx.submit_action::<HeatmapGridAction>(HeatmapGridAction::CellHover(new_hovered_cell));
             ctx.request_paint_only();
@@ -516,6 +532,7 @@ impl Widget for HeatmapGridWidget {
 
         match event {
             PointerEvent::Leave(_) | PointerEvent::Cancel(_) => {
+                info!("HeatmapGridWidget pointer left or cancelled: event={:?}", event);
                 if self.grid_hovered {
                     self.grid_hovered = false;
                     ctx.submit_action::<HeatmapGridAction>(HeatmapGridAction::GridHover(false));
@@ -526,17 +543,7 @@ impl Widget for HeatmapGridWidget {
                     ctx.request_paint_only();
                 }
             }
-            _ => {
-                if !is_hovered && self.grid_hovered {
-                    self.grid_hovered = false;
-                    ctx.submit_action::<HeatmapGridAction>(HeatmapGridAction::GridHover(false));
-                    if self.hovered_cell.is_some() {
-                        self.hovered_cell = None;
-                        ctx.submit_action::<HeatmapGridAction>(HeatmapGridAction::CellHover(None));
-                        ctx.request_paint_only();
-                    }
-                }
-            }
+            _ => {}
         }
     }
 }
@@ -617,14 +624,18 @@ where
     ) -> MessageResult<Action> {
         match message.take_message::<HeatmapGridAction>() {
             Some(action) => {
+                trace!("HeatmapGridStaticView received action: {:?}", action);
                 match *action {
                     HeatmapGridAction::CellHover(Some(cell)) => {
+                        info!("HeatmapGridStaticView cell hover action: CellHover(Some({:?}))", cell);
                         MessageResult::Action((self.on_cell_hover)(app_state, cell, true))
                     }
                     HeatmapGridAction::CellHover(None) => {
+                        info!("HeatmapGridStaticView cell hover action: CellHover(None)");
                         MessageResult::Action((self.on_cell_hover)(app_state, (0, 0), false))
                     }
                     HeatmapGridAction::GridHover(hovered) => {
+                        info!("HeatmapGridStaticView grid hover action: GridHover({})", hovered);
                         MessageResult::Action((self.on_grid_hover)(app_state, hovered))
                     }
                 }

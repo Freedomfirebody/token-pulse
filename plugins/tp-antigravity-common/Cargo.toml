@@ -1,17 +1,15 @@
 [package]
-name = "tp-collector-antigravity"
+name = "tp-antigravity-common"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 tp-protocol.workspace = true
-tp-collector.workspace = true
-tp-antigravity-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 tokio.workspace = true
-async-trait.workspace = true
 tracing.workspace = true
-parking_lot.workspace = true
+reqwest.workspace = true
+sysinfo.workspace = true
 dirs.workspace = true

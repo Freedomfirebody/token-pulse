@@ -134,12 +134,6 @@ async fn run_pipeline(
     );
     info!("Data Pool 就绪");
 
-    // 调试诊断: 启动时强制重置/清空数据池存储，确保每次启动都有一个绝对干净的起点以排查问题
-    info!("调试诊断: 启动时强制清空存储以排查重复统计并重构缓存...");
-    if let Err(e) = pool.clear_storage() {
-        warn!("启动时清空存储失败: {:?}", e);
-    }
-
     // ===== 初始化 Cache =====
     let cache = Arc::new(
         tp_cache::DataCache::new(pool.clone() as Arc<dyn PoolStorage>)
@@ -186,17 +180,21 @@ async fn run_pipeline(
     let antigravity_root = dirs::home_dir()
         .map(|h| h.join(".gemini").join("antigravity"))
         .unwrap_or_else(|| PathBuf::from("."));
-    coordinator.register(Arc::new(
+    let antigravity_collector = Arc::new(
         tp_collector_antigravity::AntigravityCollector::new(antigravity_root.clone(), tp_protocol::SourceName::Antigravity)
-    ));
+    );
+    antigravity_collector.start_background_ingest();
+    coordinator.register(antigravity_collector.clone());
 
-    // Antigravity IDE Offline Collector
+    // Antigravity IDE Collector (纯 RPC 流式采集)
     let antigravity_ide_root = dirs::home_dir()
         .map(|h| h.join(".gemini").join("antigravity-ide"))
         .unwrap_or_else(|| PathBuf::from("."));
-    coordinator.register(Arc::new(
-        tp_collector_antigravity::AntigravityCollector::new(antigravity_ide_root.clone(), tp_protocol::SourceName::AntigravityIDE)
-    ));
+    let antigravity_ide_collector = Arc::new(
+        tp_collector_antigravity_ide::AntigravityIdeCollector::new(antigravity_ide_root.clone(), tp_protocol::SourceName::AntigravityIDE)
+    );
+    antigravity_ide_collector.start_background_ingest();
+    coordinator.register(antigravity_ide_collector.clone());
 
     // Codex Collector
     coordinator.register(Arc::new(tp_collector_codex::CodexCollector::new()));
@@ -259,6 +257,8 @@ async fn run_pipeline(
     let cache_for_cmd = cache.clone();
     let aggregator_for_cmd = aggregator.clone();
     let collector_cmd_tx_for_cmd = collector_cmd_tx.clone();
+    let antigravity_for_cmd = antigravity_collector.clone();
+    let antigravity_ide_for_cmd = antigravity_ide_collector.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -291,9 +291,12 @@ async fn run_pipeline(
                                     }
                                     // 2. 清空 cache 内存状态
                                     cache_for_cmd.clear();
-                                    // 3. 广播重置采集器并从 0 强制拉取
+                                    // 3. 重置流式采集器内部状态（store + cursors + session offsets）
+                                    antigravity_for_cmd.trigger_rebuild();
+                                    antigravity_ide_for_cmd.trigger_rebuild();
+                                    // 4. 广播重置非流式采集器（Codex/Claude）并从 0 强制拉取
                                     let _ = collector_cmd_tx_for_cmd.send(tp_collector::CollectorCommand::TriggerRebuild);
-                                    // 4. 立即刷新展示 (将重置为全空状态)
+                                    // 5. 立即刷新展示 (将重置为全空状态)
                                     if let Err(e) = aggregator_for_cmd.request_refresh().await {
                                         error!("Refresh 失败: {:?}", e);
                                     }
