@@ -25,7 +25,7 @@ pub mod window {
     pub use crate::IncrementalAggregator;
 }
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,26 @@ pub struct AggregationSnapshot {
     /// 项目费用统计
     #[serde(default)]
     pub project_costs: HashMap<String, f64>,
+    #[serde(default)]
+    pub by_day_source: BTreeMap<String, HashMap<SourceName, tp_protocol::view::DailyStats>>,
+    #[serde(default)]
+    pub by_hour_source: BTreeMap<String, HashMap<SourceName, TokenInfo>>,
+    #[serde(default)]
+    pub project_sources: HashMap<String, HashSet<SourceName>>,
+    #[serde(default)]
+    pub model_sources: HashMap<String, HashSet<SourceName>>,
+    /// 来源记录计数
+    #[serde(default)]
+    pub source_records: HashMap<SourceName, u64>,
+    /// 来源费用统计
+    #[serde(default)]
+    pub source_costs: HashMap<SourceName, f64>,
+    /// 模型记录计数
+    #[serde(default)]
+    pub model_records: HashMap<String, u64>,
+    /// 模型费用统计
+    #[serde(default)]
+    pub model_costs: HashMap<String, f64>,
 }
 
 impl Default for AggregationSnapshot {
@@ -96,6 +116,14 @@ impl Default for AggregationSnapshot {
             project_names: HashMap::new(),
             project_records: HashMap::new(),
             project_costs: HashMap::new(),
+            by_day_source: BTreeMap::new(),
+            by_hour_source: BTreeMap::new(),
+            project_sources: HashMap::new(),
+            model_sources: HashMap::new(),
+            source_records: HashMap::new(),
+            source_costs: HashMap::new(),
+            model_records: HashMap::new(),
+            model_costs: HashMap::new(),
         }
     }
 }
@@ -121,6 +149,14 @@ struct AggregationState {
     project_names: HashMap<String, String>,
     project_records: HashMap<String, u64>,
     project_costs: HashMap<String, f64>,
+    pub by_day_source: BTreeMap<String, HashMap<SourceName, tp_protocol::view::DailyStats>>,
+    pub by_hour_source: BTreeMap<String, HashMap<SourceName, TokenInfo>>,
+    pub project_sources: HashMap<String, HashSet<SourceName>>,
+    pub model_sources: HashMap<String, HashSet<SourceName>>,
+    source_records: HashMap<SourceName, u64>,
+    source_costs: HashMap<SourceName, f64>,
+    model_records: HashMap<String, u64>,
+    model_costs: HashMap<String, f64>,
 }
 
 impl Default for AggregationState {
@@ -140,6 +176,14 @@ impl Default for AggregationState {
             project_names: HashMap::new(),
             project_records: HashMap::new(),
             project_costs: HashMap::new(),
+            by_day_source: BTreeMap::new(),
+            by_hour_source: BTreeMap::new(),
+            project_sources: HashMap::new(),
+            model_sources: HashMap::new(),
+            source_records: HashMap::new(),
+            source_costs: HashMap::new(),
+            model_records: HashMap::new(),
+            model_costs: HashMap::new(),
         }
     }
 }
@@ -162,6 +206,14 @@ impl AggregationState {
             project_names: snap.project_names.clone(),
             project_records: snap.project_records.clone(),
             project_costs: snap.project_costs.clone(),
+            by_day_source: snap.by_day_source.clone(),
+            by_hour_source: snap.by_hour_source.clone(),
+            project_sources: snap.project_sources.clone(),
+            model_sources: snap.model_sources.clone(),
+            source_records: snap.source_records.clone(),
+            source_costs: snap.source_costs.clone(),
+            model_records: snap.model_records.clone(),
+            model_costs: snap.model_costs.clone(),
         }
     }
 
@@ -182,6 +234,14 @@ impl AggregationState {
             project_names: self.project_names.clone(),
             project_records: self.project_records.clone(),
             project_costs: self.project_costs.clone(),
+            by_day_source: self.by_day_source.clone(),
+            by_hour_source: self.by_hour_source.clone(),
+            project_sources: self.project_sources.clone(),
+            model_sources: self.model_sources.clone(),
+            source_records: self.source_records.clone(),
+            source_costs: self.source_costs.clone(),
+            model_records: self.model_records.clone(),
+            model_costs: self.model_costs.clone(),
         }
     }
 
@@ -219,6 +279,22 @@ impl AggregationState {
             entry.cost_usd += stats.cost_usd;
             entry.message_count += stats.message_count;
         }
+        for (day_key, other_source_map) in &other.by_day_source {
+            let self_source_map = self.by_day_source.entry(day_key.clone()).or_default();
+            for (source, stats) in other_source_map {
+                let entry = self_source_map.entry(*source).or_default();
+                entry.token_info.accumulate(&stats.token_info);
+                entry.record_count += stats.record_count;
+                entry.cost_usd += stats.cost_usd;
+                entry.message_count += stats.message_count;
+            }
+        }
+        for (hour_key, other_source_map) in &other.by_hour_source {
+            let self_source_map = self.by_hour_source.entry(hour_key.clone()).or_default();
+            for (source, info) in other_source_map {
+                self_source_map.entry(*source).or_default().accumulate(info);
+            }
+        }
         for (project, name) in &other.project_names {
             self.project_names.entry(project.clone()).or_insert_with(|| name.clone());
         }
@@ -227,6 +303,30 @@ impl AggregationState {
         }
         for (project, cost) in &other.project_costs {
             *self.project_costs.entry(project.clone()).or_default() += cost;
+        }
+        for (project, sources) in &other.project_sources {
+            self.project_sources
+                .entry(project.clone())
+                .or_default()
+                .extend(sources.iter().copied());
+        }
+        for (model, sources) in &other.model_sources {
+            self.model_sources
+                .entry(model.clone())
+                .or_default()
+                .extend(sources.iter().copied());
+        }
+        for (source, count) in &other.source_records {
+            *self.source_records.entry(*source).or_default() += count;
+        }
+        for (source, cost) in &other.source_costs {
+            *self.source_costs.entry(*source).or_default() += cost;
+        }
+        for (model, count) in &other.model_records {
+            *self.model_records.entry(model.clone()).or_default() += count;
+        }
+        for (model, cost) in &other.model_costs {
+            *self.model_costs.entry(model.clone()).or_default() += cost;
         }
     }
 }
@@ -278,6 +378,8 @@ impl IncrementalAggregator {
             .entry(log.source_name)
             .or_default()
             .accumulate(token);
+        *self.state.source_records.entry(log.source_name).or_default() += 1;
+        *self.state.source_costs.entry(log.source_name).or_default() += cost;
 
         // 4. 按模型
         self.state
@@ -285,6 +387,8 @@ impl IncrementalAggregator {
             .entry(log.source_model.clone())
             .or_default()
             .accumulate(token);
+        *self.state.model_records.entry(log.source_model.clone()).or_default() += 1;
+        *self.state.model_costs.entry(log.source_model.clone()).or_default() += cost;
 
         // 5. 按项目
         self.state
@@ -304,7 +408,7 @@ impl IncrementalAggregator {
         let hour_key = log.hour_key();
         self.state
             .by_hour
-            .entry(hour_key)
+            .entry(hour_key.clone())
             .or_default()
             .accumulate(token);
 
@@ -317,11 +421,22 @@ impl IncrementalAggregator {
             .accumulate(token);
 
         // 7.5. 按天更详细的统计
-        let day_stats = self.state.by_day_stats.entry(day_key).or_default();
+        let day_stats = self.state.by_day_stats.entry(day_key.clone()).or_default();
         day_stats.token_info.accumulate(token);
         day_stats.record_count += 1;
         day_stats.cost_usd += cost;
         day_stats.message_count += 1;
+
+        let day_source_map = self.state.by_day_source.entry(day_key).or_default();
+        let day_source_stats = day_source_map.entry(log.source_name).or_default();
+        day_source_stats.token_info.accumulate(token);
+        day_source_stats.record_count += 1;
+        day_source_stats.cost_usd += cost;
+        day_source_stats.message_count += 1;
+
+        let hour_source_map = self.state.by_hour_source.entry(hour_key).or_default();
+        let hour_source_info = hour_source_map.entry(log.source_name).or_default();
+        hour_source_info.accumulate(token);
 
         // 8. 按月
         let month_key = log.month_key();
@@ -337,6 +452,19 @@ impl IncrementalAggregator {
             .entry(log.source_report_class)
             .or_default()
             .accumulate(token);
+
+        // 9.5. 记录项目与模型的来源映射
+        self.state
+            .project_sources
+            .entry(log.source_project.clone())
+            .or_default()
+            .insert(log.source_name);
+
+        self.state
+            .model_sources
+            .entry(log.source_model.clone())
+            .or_default()
+            .insert(log.source_name);
 
         // 10. 记录数
         self.state.record_count += 1;
@@ -387,12 +515,16 @@ impl IncrementalAggregator {
                     .state
                     .by_source
                     .iter()
-                    .map(|(source, info)| DimensionEntry {
-                        key: source.to_string(),
-                        token_info: *info,
-                        record_count: 0, // 维度级记录数暂不追踪
-                        cost_usd: self.pricing.calculate_cost(&source.to_string(), info),
-                        display_name: None,
+                    .map(|(source, info)| {
+                        let record_count = self.state.source_records.get(source).copied().unwrap_or(0);
+                        let cost_usd = self.state.source_costs.get(source).copied().unwrap_or(0.0);
+                        DimensionEntry {
+                            key: source.to_string(),
+                            token_info: *info,
+                            record_count,
+                            cost_usd,
+                            display_name: None,
+                        }
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -403,12 +535,16 @@ impl IncrementalAggregator {
                     .state
                     .by_model
                     .iter()
-                    .map(|(model, info)| DimensionEntry {
-                        key: model.clone(),
-                        token_info: *info,
-                        record_count: 0,
-                        cost_usd: self.pricing.calculate_cost(model, info),
-                        display_name: None,
+                    .map(|(model, info)| {
+                        let record_count = self.state.model_records.get(model).copied().unwrap_or(0);
+                        let cost_usd = self.state.model_costs.get(model).copied().unwrap_or(0.0);
+                        DimensionEntry {
+                            key: model.clone(),
+                            token_info: *info,
+                            record_count,
+                            cost_usd,
+                            display_name: None,
+                        }
                     })
                     .collect();
                 entries.sort_by(|a, b| b.token_info.total().cmp(&a.token_info.total()));
@@ -837,5 +973,82 @@ mod tests {
         let snap = agg.snapshot();
         assert_eq!(snap.record_count, 0);
         assert!(snap.total_tokens.is_zero());
+    }
+
+    #[test]
+    fn test_source_breakdown_ingest_merge_and_roundtrip() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 5, 26)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let mut agg1 = IncrementalAggregator::new();
+        agg1.ingest_one(&make_log(SourceName::Antigravity, "gemini-3.5-flash", "s1", dt, 100, 200));
+
+        let snap1 = agg1.snapshot();
+        assert!(snap1.by_day_source.contains_key("2026-05-26"));
+        let day_map1 = snap1.by_day_source.get("2026-05-26").unwrap();
+        assert!(day_map1.contains_key(&SourceName::Antigravity));
+        assert_eq!(day_map1.get(&SourceName::Antigravity).unwrap().token_info.input, 100);
+
+        assert!(snap1.by_hour_source.contains_key("2026-05-26T10"));
+        let hour_map1 = snap1.by_hour_source.get("2026-05-26T10").unwrap();
+        assert!(hour_map1.contains_key(&SourceName::Antigravity));
+        assert_eq!(hour_map1.get(&SourceName::Antigravity).unwrap().input, 100);
+
+        // Test merge
+        let mut agg2 = IncrementalAggregator::new();
+        agg2.ingest_one(&make_log(SourceName::Codex, "gpt-4o", "s2", dt, 50, 75));
+
+        agg1.merge(&agg2);
+        let snap_merged = agg1.snapshot();
+        let day_map_merged = snap_merged.by_day_source.get("2026-05-26").unwrap();
+        assert!(day_map_merged.contains_key(&SourceName::Antigravity));
+        assert!(day_map_merged.contains_key(&SourceName::Codex));
+        assert_eq!(day_map_merged.get(&SourceName::Antigravity).unwrap().token_info.input, 100);
+        assert_eq!(day_map_merged.get(&SourceName::Codex).unwrap().token_info.input, 50);
+
+        // Test roundtrip
+        let restored = IncrementalAggregator::from_snapshot(&snap_merged);
+        let snap_restored = restored.snapshot();
+        assert_eq!(snap_restored.by_day_source.len(), snap_merged.by_day_source.len());
+        assert_eq!(snap_restored.by_hour_source.len(), snap_merged.by_hour_source.len());
+    }
+
+    #[test]
+    fn test_project_and_model_sources() {
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 5, 26)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let mut agg1 = IncrementalAggregator::new();
+        agg1.ingest_one(&make_log(SourceName::Antigravity, "gemini-3.5-flash", "proj-a", dt, 100, 200));
+
+        let mut agg2 = IncrementalAggregator::new();
+        agg2.ingest_one(&make_log(SourceName::Codex, "gemini-3.5-flash", "proj-a", dt, 50, 75));
+        agg2.ingest_one(&make_log(SourceName::Codex, "gpt-4o", "proj-b", dt, 50, 75));
+
+        agg1.merge(&agg2);
+        let snap = agg1.snapshot();
+
+        // Verification
+        let proj_a_sources = snap.project_sources.get("proj-a").unwrap();
+        assert!(proj_a_sources.contains(&SourceName::Antigravity));
+        assert!(proj_a_sources.contains(&SourceName::Codex));
+
+        let proj_b_sources = snap.project_sources.get("proj-b").unwrap();
+        assert!(!proj_b_sources.contains(&SourceName::Antigravity));
+        assert!(proj_b_sources.contains(&SourceName::Codex));
+
+        let gemini_sources = snap.model_sources.get("gemini-3.5-flash").unwrap();
+        assert!(gemini_sources.contains(&SourceName::Antigravity));
+        assert!(gemini_sources.contains(&SourceName::Codex));
+
+        let gpt_sources = snap.model_sources.get("gpt-4o").unwrap();
+        assert!(gpt_sources.contains(&SourceName::Codex));
+        assert!(!gpt_sources.contains(&SourceName::Antigravity));
     }
 }

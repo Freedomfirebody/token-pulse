@@ -28,7 +28,7 @@ pub fn format_short_tokens(value: u64) -> String {
 pub fn weekly_chart_view<State: 'static>(
     summary: &tp_protocol::view::DashboardView,
 ) -> impl WidgetView<State> {
-    let today = chrono::Local::now().date_naive();
+    let today = chrono::Utc::now().date_naive();
     
     // 1. 获取最近 7 天 (含今日) 的日期与 Token 总使用量
     let mut daily_tokens = Vec::new();

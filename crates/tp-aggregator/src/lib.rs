@@ -72,26 +72,27 @@ impl DataShow {
             AggregatorError::PoolError(format!("pool query_active failed: {e}"))
         })?;
 
+        // Filter hot data to keep only records strictly newer than cache boundary
+        // to prevent double counting since the cache snap already covers all data up to the termination key.
+        let filtered_hot_data = if let Some(ref term_key) = cached_view.cache_termination_key {
+            hot_data
+                .into_iter()
+                .filter(|log| log.hour_key() > *term_key)
+                .collect::<Vec<_>>()
+        } else {
+            hot_data
+        };
+
         debug!(
-            hot_records = hot_data.len(),
-            "refresh: pulled cold-data snapshot and hot-data"
+            hot_records = filtered_hot_data.len(),
+            "refresh: pulled cold-data snapshot and filtered hot-data"
         );
 
         // ---- Step 3: Merge into a fresh aggregator ----
         let mut agg = IncrementalAggregator::new();
 
-        // Feed cached daily_series back as pre-aggregated tokens.
-        // The cache snapshot already contains historical aggregates, so we
-        // reconstruct from its dimension breakdowns instead of re-reading
-        // raw records. We use the cache view's DimensionEntry data.
-        //
-        // However, the simplest correct approach is to use the cache
-        // snapshot as the *base* view and overlay hot data on top.
-        // This avoids double-counting since cache covers archived data
-        // and pool covers today's active data.
-        //
-        // Feed hot-data records into the aggregator for fresh computation.
-        agg.ingest(&hot_data);
+        // Feed filtered hot-data records into the aggregator for fresh computation.
+        agg.ingest(&filtered_hot_data);
 
         // Store updated aggregator
         {
@@ -100,7 +101,7 @@ impl DataShow {
         }
 
         // ---- Step 4: Build DashboardView ----
-        let view = self.build_view(&cached_view, &hot_data)?;
+        let view = self.build_view(&cached_view, &filtered_hot_data)?;
 
         // ---- Step 5: Push to watch channel ----
         // Ignore send error (no receivers is fine)
@@ -245,6 +246,33 @@ impl DataShow {
             }
         }
 
+        let mut daily_by_source = cached_view.daily_by_source.clone();
+        for (day_key, hot_source_map) in &snap.by_day_source {
+            let day_map = daily_by_source.entry(day_key.clone()).or_default();
+            for (source, hot_stats) in hot_source_map {
+                let entry = day_map.entry(*source).or_default();
+                entry.token_info.accumulate(&hot_stats.token_info);
+                entry.record_count += hot_stats.record_count;
+                entry.cost_usd += hot_stats.cost_usd;
+                entry.message_count += hot_stats.message_count;
+            }
+        }
+
+        let mut hourly_today_by_source = std::collections::BTreeMap::new();
+        for (hh, source_map) in &cached_view.hourly_today_by_source {
+            hourly_today_by_source.insert(hh.clone(), source_map.clone());
+        }
+        let today_prefix = now.format("%Y-%m-%dT").to_string();
+        for (hour_key, hot_source_map) in &snap.by_hour_source {
+            if hour_key.starts_with(&today_prefix) {
+                let hh = &hour_key[11..];
+                let hour_map = hourly_today_by_source.entry(hh.to_string()).or_default();
+                for (source, info) in hot_source_map {
+                    hour_map.entry(*source).or_default().accumulate(info);
+                }
+            }
+        }
+
         // ----- Recent records (last 50, sorted by datetime desc) -----
         let mut recent: Vec<RecentRecord> = hot_data
             .iter()
@@ -261,6 +289,38 @@ impl DataShow {
             if is_uuid {
                 r.source_project = registry.get_title(&r.source_project);
             }
+        }
+
+        // ----- Merge project_sources & resolve UUID keys to registry titles -----
+        let mut project_sources: std::collections::HashMap<String, std::collections::HashSet<tp_protocol::SourceName>> = std::collections::HashMap::new();
+
+        let mut merge_project_sources = |key: &String, sources: &std::collections::HashSet<tp_protocol::SourceName>| {
+            let is_uuid = key.len() == 36 && key.chars().filter(|&c| c == '-').count() == 4;
+            let resolved_key = if is_uuid {
+                registry.get_title(key)
+            } else {
+                key.clone()
+            };
+            project_sources
+                .entry(resolved_key)
+                .or_default()
+                .extend(sources.clone());
+        };
+
+        for (key, sources) in &cached_view.project_sources {
+            merge_project_sources(key, sources);
+        }
+        for (key, sources) in &snap.project_sources {
+            merge_project_sources(key, sources);
+        }
+
+        // ----- Merge model_sources -----
+        let mut model_sources: std::collections::HashMap<String, std::collections::HashSet<tp_protocol::SourceName>> = std::collections::HashMap::new();
+        for (key, sources) in &cached_view.model_sources {
+            model_sources.entry(key.clone()).or_default().extend(sources.clone());
+        }
+        for (key, sources) in &snap.model_sources {
+            model_sources.entry(key.clone()).or_default().extend(sources.clone());
         }
 
         Ok(DashboardView {
@@ -282,6 +342,10 @@ impl DataShow {
             last_updated: now,
             source_status: cached_view.source_status.clone(),
             cache_termination_key: cached_view.cache_termination_key.clone(),
+            daily_by_source,
+            hourly_today_by_source,
+            project_sources,
+            model_sources,
         })
     }
 

@@ -315,6 +315,7 @@ impl DataCache {
     /// 从聚合器状态构建 `DashboardView` 快照。
     fn build_dashboard_view(&self) -> DashboardView {
         let agg = self.aggregator.read();
+        let snap = agg.snapshot();
         let now = Utc::now();
 
         DashboardView {
@@ -323,11 +324,11 @@ impl DataCache {
             today_tokens: agg.window(TimeWindow::Today, now),
             week_tokens: agg.window(TimeWindow::ThisWeek, now),
             month_tokens: agg.window(TimeWindow::ThisMonth, now),
-            total_cost: agg.snapshot().total_cost,
+            total_cost: snap.total_cost,
             today_cost: 0.0,  // 精确的日费用需要逐条记录，此处暂用 0
             week_cost: 0.0,   // 同上
             month_cost: 0.0,  // 同上
-            record_count: agg.snapshot().record_count,
+            record_count: snap.record_count,
 
             // 分维度聚合
             by_source: agg.project(&Dimension::BySource),
@@ -335,11 +336,11 @@ impl DataCache {
             by_project: agg.project(&Dimension::ByProject),
 
             // 时间序列
-            daily_series: agg.snapshot().by_day_stats,
+            daily_series: snap.by_day_stats.clone(),
             hourly_today: {
                 let mut hourly_today: std::collections::BTreeMap<String, TokenInfo> = std::collections::BTreeMap::new();
                 let today_prefix = now.format("%Y-%m-%dT").to_string();
-                for (hour_key, info) in &agg.snapshot().by_hour {
+                for (hour_key, info) in &snap.by_hour {
                     if hour_key.starts_with(&today_prefix) {
                         let hh = &hour_key[11..];
                         hourly_today.entry(hh.to_string()).or_default().accumulate(info);
@@ -350,6 +351,23 @@ impl DataCache {
 
             // 最近活跃 — 由 data-show 层从 pool hot-data 获取
             recent_records: Vec::new(),
+
+            daily_by_source: snap.by_day_source.clone(),
+            hourly_today_by_source: {
+                let mut hourly_today_by_source = std::collections::BTreeMap::new();
+                let today_prefix = now.format("%Y-%m-%dT").to_string();
+                for (hour_key, source_map) in &snap.by_hour_source {
+                    if hour_key.starts_with(&today_prefix) {
+                        let hh = &hour_key[11..];
+                        hourly_today_by_source.insert(hh.to_string(), source_map.clone());
+                    }
+                }
+                hourly_today_by_source
+            },
+
+            // New fields
+            project_sources: snap.project_sources.clone(),
+            model_sources: snap.model_sources.clone(),
 
             // 元信息
             last_updated: now,
@@ -418,7 +436,7 @@ mod tests {
     use chrono::DateTime;
     use tp_protocol::datalog::{Datalog, ReportClass, SourceName, TokenInfo};
     use tp_protocol::error::{PoolError, PushResult};
-    use tp_protocol::meta::{MetaIndex, PartitionTier, PoolMetadata};
+    use tp_protocol::meta::{PartitionTier, PoolMetadata};
 
     // ===== Mock PoolStorage =====
 

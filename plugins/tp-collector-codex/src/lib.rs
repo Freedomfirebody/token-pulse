@@ -432,7 +432,7 @@ impl DatasourceProvider for CodexCollector {
                 source_parent_project: None,
                 source_report_class: ReportClass::Official,
                 token_info: TokenInfo {
-                    input: ev.input_tokens,
+                    input: ev.input_tokens.saturating_sub(ev.cached_input_tokens),
                     output: ev.output_tokens,
                     cache: ev.cached_input_tokens,
                     resourcing: 0,
@@ -483,7 +483,7 @@ impl DatasourceProvider for CodexCollector {
                 source_parent_project: None,
                 source_report_class: ReportClass::Official,
                 token_info: TokenInfo {
-                    input: ev.input_tokens,
+                    input: ev.input_tokens.saturating_sub(ev.cached_input_tokens),
                     output: ev.output_tokens,
                     cache: ev.cached_input_tokens,
                     resourcing: 0,

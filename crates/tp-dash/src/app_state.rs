@@ -156,42 +156,21 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
                 }
             };
 
-            // 1. 基于 recent_records 建立精准的动态 Lookup 关系
-            let mut recent_project_source = std::collections::HashMap::new();
-            let mut recent_model_source = std::collections::HashMap::new();
-            for r in &view.recent_records {
-                recent_project_source.insert(r.source_project.clone(), r.source_name);
-                recent_model_source.insert(r.source_model.clone(), r.source_name);
-            }
-
-            // 2. 项目匹配判定（动态 Lookup 优先 + 后备 Heuristics 判定）
+            // 1. Precise project source matching using the multi-dimensional project_sources lookup map
             let is_project_match = |project: &str| -> bool {
-                if let Some(&s) = recent_project_source.get(project) {
-                    is_match(s)
+                if let Some(sources) = view.project_sources.get(project) {
+                    sources.iter().any(|&s| is_match(s))
                 } else {
-                    let is_uuid = project.len() == 36 && project.chars().filter(|&c| c == '-').count() == 4;
-                    let has_slash = project.contains('/');
-                    match tab {
-                        DashTab::Antigravity => is_uuid,
-                        DashTab::Codex => has_slash,
-                        DashTab::ClaudeCode => !is_uuid && !has_slash,
-                        DashTab::All => true,
-                    }
+                    false
                 }
             };
 
-            // 3. 模型匹配判定（动态 Lookup 优先 + 后备 Heuristics 判定）
+            // 2. Precise model source matching using the multi-dimensional model_sources lookup map
             let is_model_match = |model: &str| -> bool {
-                if let Some(&s) = recent_model_source.get(model) {
-                    is_match(s)
+                if let Some(sources) = view.model_sources.get(model) {
+                    sources.iter().any(|&s| is_match(s))
                 } else {
-                    let m_lower = model.to_lowercase();
-                    match tab {
-                        DashTab::Antigravity => m_lower.contains("gemini"),
-                        DashTab::Codex => m_lower.contains("gpt") || m_lower.contains("codex"),
-                        DashTab::ClaudeCode => m_lower.contains("claude") || m_lower.contains("sonnet") || m_lower.contains("opus"),
-                        DashTab::All => true,
-                    }
+                    false
                 }
             };
 
@@ -206,12 +185,20 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
             let by_source: Vec<DimensionEntry> = view.by_source
                 .iter()
                 .filter(|e| {
-                    let key_lower = e.key.to_lowercase();
-                    match tab {
-                        DashTab::Antigravity => key_lower.contains("antigravity"),
-                        DashTab::Codex => key_lower.contains("codex"),
-                        DashTab::ClaudeCode => key_lower.contains("claude") || key_lower.contains("cloude") || key_lower.contains("cloude_code") || key_lower.contains("claude_code"),
-                        DashTab::All => true,
+                    match e.key.as_str() {
+                        "Antigravity" => is_match(SourceName::Antigravity),
+                        "Antigravity IDE" | "AntigravityIDE" => is_match(SourceName::AntigravityIDE),
+                        "Codex" => is_match(SourceName::Codex),
+                        "CloudeCode" | "ClaudeCode" => is_match(SourceName::CloudeCode),
+                        _ => {
+                            let key_lower = e.key.to_lowercase();
+                            match tab {
+                                DashTab::Antigravity => key_lower.contains("antigravity"),
+                                DashTab::Codex => key_lower.contains("codex"),
+                                DashTab::ClaudeCode => key_lower.contains("claude") || key_lower.contains("cloude"),
+                                DashTab::All => true,
+                            }
+                        }
                     }
                 })
                 .cloned()
@@ -243,11 +230,36 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
                 total_cost += e.cost_usd;
                 record_count += e.record_count;
             }
-            if record_count == 0 {
-                record_count = by_source.iter().map(|e| e.record_count).sum();
+
+            // 9. 重新生成今日/本周/本月指标窗口 (从 daily_series 进行累加保证完整性)
+            let mut daily_series = BTreeMap::new();
+            for (day_key, source_map) in &view.daily_by_source {
+                let mut day_tokens = TokenInfo::default();
+                let mut day_records = 0;
+                let mut day_cost = 0.0;
+                let mut day_msg = 0;
+                let mut has_any = false;
+
+                for (source, stats) in source_map {
+                    if is_match(*source) {
+                        day_tokens.accumulate(&stats.token_info);
+                        day_records += stats.record_count;
+                        day_cost += stats.cost_usd;
+                        day_msg += stats.message_count;
+                        has_any = true;
+                    }
+                }
+
+                if has_any {
+                    daily_series.insert(day_key.clone(), DailyStats {
+                        token_info: day_tokens,
+                        record_count: day_records,
+                        cost_usd: day_cost,
+                        message_count: day_msg,
+                    });
+                }
             }
 
-            // 9. 重新生成今日/本周/本月指标窗口
             let mut today_tokens = TokenInfo::default();
             let mut today_cost = 0.0;
             let mut week_tokens = TokenInfo::default();
@@ -261,61 +273,98 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
             let week_start = (now.date_naive() - chrono::Duration::days(weekday_offset)).format("%Y-%m-%d").to_string();
             let month_start = now.format("%Y-%m-01").to_string();
 
-            for r in &recent_records {
-                let day_key = r.source_datetime.format("%Y-%m-%d").to_string();
-                if day_key == today_prefix {
-                    today_tokens.accumulate(&r.token_info);
-                    today_cost += r.cost_usd;
+            for (day_key, stats) in &daily_series {
+                if day_key == &today_prefix {
+                    today_tokens.accumulate(&stats.token_info);
+                    today_cost += stats.cost_usd;
                 }
-                if day_key >= week_start {
-                    week_tokens.accumulate(&r.token_info);
-                    week_cost += r.cost_usd;
+                if day_key >= &week_start {
+                    week_tokens.accumulate(&stats.token_info);
+                    week_cost += stats.cost_usd;
                 }
-                if day_key >= month_start {
-                    month_tokens.accumulate(&r.token_info);
-                    month_cost += r.cost_usd;
-                }
-            }
-
-            // 10. 重新生成 daily_series (热力网格)，保留完整的历史网格展现，但对其数据进行按匹配判定过滤
-            let mut daily_series = BTreeMap::new();
-            for (date_str, _stats) in &view.daily_series {
-                let day_key = date_str.clone();
-                let mut day_tokens = TokenInfo::default();
-                let mut day_records = 0;
-                let mut day_cost = 0.0;
-                let mut day_msg = 0;
-                let mut has_any = false;
-
-                for r in &recent_records {
-                    if r.source_datetime.format("%Y-%m-%d").to_string() == day_key {
-                        day_tokens.accumulate(&r.token_info);
-                        day_records += 1;
-                        day_cost += r.cost_usd;
-                        day_msg += 1;
-                        has_any = true;
-                    }
-                }
-
-                if has_any {
-                    daily_series.insert(day_key, DailyStats {
-                        token_info: day_tokens,
-                        record_count: day_records,
-                        cost_usd: day_cost,
-                        message_count: day_msg,
-                    });
+                if day_key >= &month_start {
+                    month_tokens.accumulate(&stats.token_info);
+                    month_cost += stats.cost_usd;
                 }
             }
 
             // 11. 重新生成今日按小时序列数据
             let mut hourly_today: BTreeMap<String, TokenInfo> = BTreeMap::new();
-            let today_str = Utc::now().format("%Y-%m-%d").to_string();
-            for r in &recent_records {
-                if r.source_datetime.format("%Y-%m-%d").to_string() == today_str {
-                    let hh = r.source_datetime.format("%H").to_string();
-                    hourly_today.entry(hh).or_default().accumulate(&r.token_info);
+            for (hh, source_map) in &view.hourly_today_by_source {
+                let mut hour_tokens = TokenInfo::default();
+                let mut has_any = false;
+                for (source, info) in source_map {
+                    if is_match(*source) {
+                        hour_tokens.accumulate(info);
+                        has_any = true;
+                    }
+                }
+                if has_any {
+                    hourly_today.insert(hh.clone(), hour_tokens);
                 }
             }
+
+            let daily_by_source = {
+                let mut daily_by_source = BTreeMap::new();
+                for (day_key, source_map) in &view.daily_by_source {
+                    let mut filtered_source_map = std::collections::HashMap::new();
+                    for (source, stats) in source_map {
+                        if is_match(*source) {
+                            filtered_source_map.insert(*source, stats.clone());
+                        }
+                    }
+                    if !filtered_source_map.is_empty() {
+                        daily_by_source.insert(day_key.clone(), filtered_source_map);
+                    }
+                }
+                daily_by_source
+            };
+
+            let hourly_today_by_source = {
+                let mut hourly_today_by_source = BTreeMap::new();
+                for (hh, source_map) in &view.hourly_today_by_source {
+                    let mut filtered_source_map = std::collections::HashMap::new();
+                    for (source, info) in source_map {
+                        if is_match(*source) {
+                            filtered_source_map.insert(*source, *info);
+                        }
+                    }
+                    if !filtered_source_map.is_empty() {
+                        hourly_today_by_source.insert(hh.clone(), filtered_source_map);
+                    }
+                }
+                hourly_today_by_source
+            };
+
+            let project_sources = {
+                let mut filtered = std::collections::HashMap::new();
+                for (proj, sources) in &view.project_sources {
+                    let filtered_sources: std::collections::HashSet<_> = sources
+                        .iter()
+                        .copied()
+                        .filter(|&s| is_match(s))
+                        .collect();
+                    if !filtered_sources.is_empty() {
+                        filtered.insert(proj.clone(), filtered_sources);
+                    }
+                }
+                filtered
+            };
+
+            let model_sources = {
+                let mut filtered = std::collections::HashMap::new();
+                for (model, sources) in &view.model_sources {
+                    let filtered_sources: std::collections::HashSet<_> = sources
+                        .iter()
+                        .copied()
+                        .filter(|&s| is_match(s))
+                        .collect();
+                    if !filtered_sources.is_empty() {
+                        filtered.insert(model.clone(), filtered_sources);
+                    }
+                }
+                filtered
+            };
 
             DashboardView {
                 total_tokens,
@@ -336,6 +385,10 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
                 last_updated: view.last_updated,
                 source_status: view.source_status.clone(),
                 cache_termination_key: view.cache_termination_key.clone(),
+                daily_by_source,
+                hourly_today_by_source,
+                project_sources,
+                model_sources,
             }
         }
     }
@@ -707,7 +760,7 @@ fn single_part_1(state: &mut AppState) -> impl WidgetView<AppState> {
 fn single_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
     flex_col((
         // Weekly Chart Component
-        weekly_chart_view(&state.view),
+        weekly_chart_view(&state.filtered_view),
         
         FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
         flex_row((
@@ -834,7 +887,7 @@ fn dual_part_2(state: &mut AppState) -> impl WidgetView<AppState> {
         flex_row((
             // Left column: Weekly Chart + Model Usage
             flex_col((
-                weekly_chart_view(&state.view),
+                weekly_chart_view(&state.filtered_view),
                 FlexSpacer::Fixed((theme::SECTION_GAP as f32).px()),
                 by_model_dual,
             ))

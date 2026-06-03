@@ -100,6 +100,16 @@ pub struct DashboardView {
     pub source_status: Vec<SourceStatus>,
     /// 缓存的中止节点 (截止的小时 key)
     pub cache_termination_key: Option<String>,
+    #[serde(default)]
+    pub daily_by_source: BTreeMap<String, std::collections::HashMap<SourceName, DailyStats>>,
+    #[serde(default)]
+    pub hourly_today_by_source: BTreeMap<String, std::collections::HashMap<SourceName, TokenInfo>>,
+
+    // ===== Precise Source Lookup Maps =====
+    #[serde(default)]
+    pub project_sources: std::collections::HashMap<String, std::collections::HashSet<SourceName>>,
+    #[serde(default)]
+    pub model_sources: std::collections::HashMap<String, std::collections::HashSet<SourceName>>,
 }
 
 /// 每日统计
@@ -162,6 +172,10 @@ impl Default for DashboardView {
             last_updated: Utc::now(),
             source_status: Vec::new(),
             cache_termination_key: None,
+            daily_by_source: BTreeMap::new(),
+            hourly_today_by_source: BTreeMap::new(),
+            project_sources: std::collections::HashMap::new(),
+            model_sources: std::collections::HashMap::new(),
         }
     }
 }

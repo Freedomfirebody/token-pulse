@@ -57,7 +57,7 @@ impl AntigravityIdeCollector {
             session_root,
             source_name,
             store: Arc::new(Mutex::new(IngestStore::new(data_dir))),
-            rpc_timeout: Duration::from_secs(15),
+            rpc_timeout: Duration::from_secs(120), // 针对超大 RPC 报文支持长超时 (120 秒)
         }
     }
 
@@ -118,22 +118,45 @@ impl AntigravityIdeCollector {
             if !connections.is_empty() {
                 let conn = &connections[0];
 
-                // IDE 版仅通过 brain/ 目录发现 session
-                let session_ids = scan_brain_session_ids(&session_root);
+                // IDE 版仅通过 brain/ 目录发现 session，读取本地最后修改时间
+                let brain_sessions = scan_brain_sessions(&session_root);
 
                 info!(
-                    count = session_ids.len(),
+                    count = brain_sessions.len(),
                     "IDE ingest: session 发现完成"
                 );
 
-                for session_id in &session_ids {
+                for (session_id, rpc_mtime) in &brain_sessions {
                     let start_offset = store.lock().session_offset(session_id);
+                    let stored_mtime = store.lock().session_modified_time(session_id);
 
-                    stream_session_steps(
+                    // 如果本地最后修改时间不为 0，且不大于我们持久化记录的时间，说明没有更新，直接跳过！
+                    if *rpc_mtime > 0 && stored_mtime > 0 && *rpc_mtime <= stored_mtime {
+                        tracing::trace!(session_id, rpc_mtime, stored_mtime, "IDE 会话无更新，跳过数据拉取");
+                        continue;
+                    }
+
+                    let step_hint = {
+                        let transcript_path = session_root
+                            .join("brain")
+                            .join(session_id)
+                            .join(".system_generated")
+                            .join("logs")
+                            .join("transcript.jsonl");
+                        count_transcript_steps(&transcript_path).unwrap_or(20)
+                    };
+
+                    let fetched = stream_session_steps(
                         &client, conn, session_id, start_offset,
-                        5000, // IDE 无 step_count hint，使用高上限
+                        step_hint,
                         source_name, &store,
                     ).await;
+
+                    if fetched > 0 || *rpc_mtime > stored_mtime {
+                        if *rpc_mtime > 0 {
+                            store.lock().update_session_modified_time(session_id, *rpc_mtime);
+                        }
+                    }
                 }
 
                 store.lock().flush();
@@ -179,107 +202,69 @@ async fn stream_session_steps(
     source_name: SourceName,
     store: &Arc<Mutex<IngestStore>>,
 ) -> usize {
-    let mut offset = start_offset;
-    let mut total_fetched = 0usize;
-    let mut batch_count = 0u32;
-    let mut current_batch_size = 20; // 安全起始大小，避免 200 导致 local server 超时挂起
-    let mut consecutive_failures = 0;
-
-    loop {
-        if offset >= step_hint {
-            break;
-        }
-
-        let end = offset + current_batch_size;
-        match client.get_trajectory_steps_paged(conn, session_id, offset, end).await {
-            Ok(steps) => {
-                consecutive_failures = 0; // 重置连续失败计数
-                if steps.is_empty() { break; }
-
-                // 如果成功且分片较小，逐步增大分片以提高速度（上限 100）
-
-                // 首批首个 step: 打印 JSON keys
-                if batch_count == 0 {
-                    if let Some(first) = steps.first() {
-                        let keys: Vec<&str> = first.as_object()
-                            .map(|o| o.keys().map(|k| k.as_str()).collect())
-                            .unwrap_or_default();
-                        info!(
-                            session_id,
-                            keys = ?keys,
-                            "IDE ingest: 首个 step JSON keys"
-                        );
-                    }
-                }
-                batch_count += 1;
-
-                let metadata: Vec<GeneratorMetadata> = steps.iter().enumerate()
-                    .filter_map(|(i, step)| {
-                        GeneratorMetadata::from_step_json(step, offset + i as u32)
-                    })
-                    .collect();
-
-                let batch_meta_count = metadata.len();
-                if !metadata.is_empty() {
-                    let datalogs = metadata_to_datalogs(source_name, session_id, &metadata);
-                    total_fetched += datalogs.len();
-                    store.lock().append(datalogs);
-                }
-
-                let batch_len = steps.len() as u32;
-                offset += batch_len;
-                store.lock().advance_session_offset(session_id, offset);
-
-                if batch_count <= 3 || batch_meta_count > 0 {
-                    info!(
-                        session_id,
-                        batch_steps = batch_len,
-                        batch_metadata = batch_meta_count,
-                        offset,
-                        current_batch_size,
-                        "IDE ingest: batch 完成"
-                    );
-                }
+    // 调用我们刚添加的 get_generator_metadata 函数进行全量拉取
+    match client.get_generator_metadata(conn, session_id, step_hint).await {
+        Ok(raw_list) => {
+            if raw_list.is_empty() {
+                return 0;
             }
-            Err(e) => {
-                consecutive_failures += 1;
-                warn!(
+
+            // 解析为 GeneratorMetadata 结构
+            let mut all_metadata: Vec<GeneratorMetadata> = raw_list.iter()
+                .filter_map(|val| GeneratorMetadata::from_rpc_json(val))
+                .collect();
+
+            // 按步骤索引排序，保证增量偏移顺序
+            all_metadata.sort_by_key(|m| m.step_indices.first().copied().unwrap_or(0));
+
+            // 增量过滤：如果全部步骤索引都小于 start_offset，则过滤掉
+            let filtered_metadata: Vec<GeneratorMetadata> = all_metadata.iter()
+                .filter(|m| {
+                    m.step_indices.is_empty() || m.step_indices.iter().any(|&idx| idx >= start_offset)
+                })
+                .cloned()
+                .collect();
+
+            let fetched_count = filtered_metadata.len();
+
+            if fetched_count > 0 {
+                // 转换为 datalogs 并追加到本地 store
+                let datalogs = metadata_to_datalogs(source_name, session_id, &filtered_metadata);
+                store.lock().append(datalogs);
+            }
+
+            // 根据所有已存在的最大 step index 推进 offset 游标
+            let next_offset = all_metadata.iter()
+                .flat_map(|m| &m.step_indices)
+                .max()
+                .copied()
+                .map(|idx| idx + 1)
+                .unwrap_or(start_offset);
+
+            if next_offset > start_offset {
+                store.lock().advance_session_offset(session_id, next_offset);
+                info!(
                     session_id,
-                    offset,
-                    current_batch_size,
-                    failures = consecutive_failures,
-                    error = %e,
-                    "IDE 分段步骤获取失败，尝试减小分片大小"
+                    total_metadata = raw_list.len(),
+                    new_metadata = fetched_count,
+                    start_offset,
+                    new_offset = next_offset,
+                    "IDE ingest: 全量元数据采集完成 (自适应超时)"
                 );
-
-                if current_batch_size > 5 {
-                    // 动态减半并设置不小于 5 的重试分片
-                    current_batch_size = (current_batch_size / 2).max(5);
-                    info!(
-                        session_id,
-                        offset,
-                        new_batch_size = current_batch_size,
-                        "调整分片大小以重新尝试"
-                    );
-                    // 给本地 language server 0.5s 恢复喘息时间
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                } else {
-                    warn!(
-                        session_id,
-                        offset,
-                        "最小分片下获取仍失败，停止当前 session"
-                    );
-                    break;
-                }
             }
+
+            fetched_count
+        }
+        Err(e) => {
+            warn!(
+                session_id,
+                start_offset,
+                error = %e,
+                "IDE 全量元数据采集失败"
+            );
+            0
         }
     }
-
-    if total_fetched > 0 || offset > start_offset {
-        info!(session_id, total_fetched, offset, "IDE session steps 流式采集完成");
-    }
-
-    total_fetched
 }
 
 fn metadata_to_datalogs(
@@ -316,20 +301,37 @@ fn metadata_to_datalogs(
     }).collect()
 }
 
-fn scan_brain_session_ids(session_root: &Path) -> Vec<String> {
+fn scan_brain_sessions(session_root: &Path) -> Vec<(String, u64)> {
     let brain_dir = session_root.join("brain");
     if !brain_dir.exists() { return vec![]; }
 
-    let mut ids = Vec::new();
+    let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&brain_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.len() >= 32 && name.contains('-') {
-                    ids.push(name);
+                    let mut mtime = 0;
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(duration) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                                mtime = duration.as_millis() as u64;
+                            }
+                        }
+                    }
+                    sessions.push((name, mtime));
                 }
             }
         }
     }
-    ids
+    sessions
 }
+
+/// 计算本地 transcript.jsonl 的行数作为实际步数
+fn count_transcript_steps(path: &Path) -> Option<u32> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    Some(reader.lines().count() as u32)
+}
+

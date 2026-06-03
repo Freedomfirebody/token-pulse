@@ -32,7 +32,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 15000,
+                input: 12000,
                 output: 8000,
                 cache: 3000,
                 resourcing: 0,
@@ -50,7 +50,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 50000,
+                input: 40000,
                 output: 25000,
                 cache: 10000,
                 resourcing: 500,
@@ -68,7 +68,7 @@ fn mock_antigravity_data() -> Vec<Datalog> {
             source_parent_project: Some("session-ag-002".to_string()),
             source_report_class: ReportClass::Calculate,
             token_info: TokenInfo {
-                input: 5000,
+                input: 4000,
                 output: 2000,
                 cache: 1000,
                 resourcing: 0,
@@ -95,7 +95,7 @@ fn mock_codex_data() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 20000,
+                input: 15000,
                 output: 15000,
                 cache: 5000,
                 resourcing: 0,
@@ -113,7 +113,7 @@ fn mock_codex_data() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 35000,
+                input: 27000,
                 output: 18000,
                 cache: 8000,
                 resourcing: 0,
@@ -140,7 +140,7 @@ fn mock_claude_data() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 40000,
+                input: 28000,
                 output: 20000,
                 cache: 12000,
                 resourcing: 0,
@@ -166,7 +166,7 @@ fn mock_historical_data_yesterday() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 10000,
+                input: 8000,
                 output: 5000,
                 cache: 2000,
                 resourcing: 0,
@@ -197,7 +197,7 @@ fn mock_historical_data_last_month() -> Vec<Datalog> {
             source_parent_project: None,
             source_report_class: ReportClass::Official,
             token_info: TokenInfo {
-                input: 30000,
+                input: 25000,
                 output: 15000,
                 cache: 5000,
                 resourcing: 0,
@@ -246,9 +246,9 @@ async fn test_full_pipeline_mock_datasources() {
 
     // 6. 验证 token 总量
     let total_input: u64 = active_data.iter().map(|d| d.token_info.input).sum();
-    let expected_input: u64 = 15000 + 50000 + 5000 + 20000 + 35000 + 40000;
+    let expected_input: u64 = 12000 + 40000 + 4000 + 15000 + 27000 + 28000;
     assert_eq!(total_input, expected_input, "Total input tokens mismatch");
-    println!("✅ Total input tokens: {} (expected {})", total_input, expected_input);
+    println!("✅ Total input tokens (uncached): {} (expected {})", total_input, expected_input);
 
     // 7. 初始化 Cache
     let cache = Arc::new(tp_cache::DataCache::new(pool_storage.clone()));

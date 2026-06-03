@@ -34,6 +34,10 @@ pub struct IngestStore {
     /// 持久化到磁盘，重启后增量续采
     session_offsets: HashMap<String, u32>,
 
+    /// 每个 session 上次用户对 session 的修改时间（时间戳，毫秒级）
+    /// 持久化到磁盘，重启后增量续采
+    session_modified_times: HashMap<String, u64>,
+
     /// 持久化目录 (~/.token-pulse/token-monitor/{folder}/data/)
     data_dir: PathBuf,
 
@@ -55,8 +59,13 @@ impl IngestStore {
         let session_offsets: HashMap<String, u32> = Self::load_json(&data_dir.join("session_offsets.json"))
             .unwrap_or_default();
 
+        // 加载持久化的 session 修改时间（用于避开无修改的 session 查询）
+        let session_modified_times: HashMap<String, u64> = Self::load_json(&data_dir.join("session_modified_times.json"))
+            .unwrap_or_default();
+
         debug!(
             sessions = session_offsets.len(),
+            modified_sessions = session_modified_times.len(),
             dir = %data_dir.display(),
             "IngestStore 初始化完成"
         );
@@ -65,6 +74,7 @@ impl IngestStore {
             entries: Vec::new(),
             cursors: HashMap::new(), // 启动时重置（entries 是空的）
             session_offsets,
+            session_modified_times,
             data_dir,
             offsets_dirty: false,
         }
@@ -83,11 +93,25 @@ impl IngestStore {
         self.session_offsets.get(session_id).copied().unwrap_or(0)
     }
 
+    /// 获取指定 session 上次修改时间
+    pub fn session_modified_time(&self, session_id: &str) -> u64 {
+        self.session_modified_times.get(session_id).copied().unwrap_or(0)
+    }
+
     /// 更新指定 session 的 step offset（仅标记 dirty，不立即写盘）
     pub fn advance_session_offset(&mut self, session_id: &str, new_offset: u32) {
         let current = self.session_offsets.get(session_id).copied().unwrap_or(0);
         if new_offset > current {
             self.session_offsets.insert(session_id.to_string(), new_offset);
+            self.offsets_dirty = true;
+        }
+    }
+
+    /// 更新指定 session 的修改时间（时间戳，标记 dirty，不立即写盘）
+    pub fn update_session_modified_time(&mut self, session_id: &str, mtime: u64) {
+        let current = self.session_modified_times.get(session_id).copied().unwrap_or(0);
+        if mtime > current {
+            self.session_modified_times.insert(session_id.to_string(), mtime);
             self.offsets_dirty = true;
         }
     }
@@ -98,6 +122,10 @@ impl IngestStore {
             Self::save_json(
                 &self.data_dir.join("session_offsets.json"),
                 &self.session_offsets,
+            );
+            Self::save_json(
+                &self.data_dir.join("session_modified_times.json"),
+                &self.session_modified_times,
             );
             self.offsets_dirty = false;
         }
@@ -150,6 +178,7 @@ impl IngestStore {
         self.entries.clear();
         self.cursors.clear();
         self.session_offsets.clear();
+        self.session_modified_times.clear();
         self.offsets_dirty = false;
 
         // 持久化清空状态
@@ -160,6 +189,10 @@ impl IngestStore {
         Self::save_json(
             &self.data_dir.join("session_offsets.json"),
             &self.session_offsets,
+        );
+        Self::save_json(
+            &self.data_dir.join("session_modified_times.json"),
+            &self.session_modified_times,
         );
 
         debug!(

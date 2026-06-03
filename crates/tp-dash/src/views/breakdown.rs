@@ -51,13 +51,16 @@ impl BreakdownComponent {
     /// - 因此: INPUT + OUTPUT + REASONING = 100% of Total
     /// - Cache Hit Rate 为独立指标: cache / input × 100%
     pub fn update(&mut self, summary: &tp_protocol::view::DashboardView) {
-        // Gemini API 模型: input 已包含 cache（cache 是 input 的子集）
-        let total_input = summary.total_tokens.input;
+        // under the unified separation model:
+        // summary.total_tokens.input is strictly uncached input
+        // summary.total_tokens.cache is strictly cached input
+        let total_input_uncached = summary.total_tokens.input;
+        let total_cache = summary.total_tokens.cache;
+        let total_input = total_input_uncached + total_cache; // Total prompt/input tokens processed
         let total_output = summary.total_tokens.output;
         let total_reasoning = summary.total_tokens.reasoning;
-        let total_cache = summary.total_tokens.cache;
 
-        // total = input + output + reasoning（Gemini API 官方公式）
+        // total = input + cache + output + reasoning (unified formula)
         let total_all = summary.total_tokens.total();
         let total_classified = total_input + total_output + total_reasoning;
         let classified_percent = if total_all > 0 {
@@ -66,24 +69,28 @@ impl BreakdownComponent {
             0.0
         };
 
-        // INPUT + OUTPUT + REASONING 的百分比应合计 100%
+        // INPUT + OUTPUT + REASONING percentages sum to 100%
         let p_input = if total_classified > 0 { (total_input as f64 / total_classified as f64) * 100.0 } else { 0.0 };
         let p_output = if total_classified > 0 { (total_output as f64 / total_classified as f64) * 100.0 } else { 0.0 };
         let p_reasoning = if total_classified > 0 { (total_reasoning as f64 / total_classified as f64) * 100.0 } else { 0.0 };
         
-        // 缓存命中率: 独立指标，表示输入中缓存命中的比例
-        let p_cache = if total_input > 0 { (total_cache as f64 / total_input as f64) * 100.0 } else { 0.0 };
+        // Cache hit rate = cache / total_input
+        let p_cache = if total_input > 0 {
+            (total_cache as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
 
         let total_width = 300.0_f32;
         let gap_size = 1.5_f32;
         let min_width = 5.0_f32;
         
-        // 比例条展示 INPUT, OUTPUT, REASONING 三个维度的占比（不含 cache 段）
-        let values = [total_input, total_output, total_reasoning];
+        // 比例条仅展示未命中输入 (total_input_uncached) 与命中输入 (total_cache) 的占比
+        let values = [total_input_uncached, total_cache];
         let active_count = values.iter().filter(|&&v| v > 0).count();
         
         let widths = if active_count == 0 {
-            vec![0.0; 3]
+            vec![0.0; 2]
         } else {
             let total_gaps = if active_count > 1 { (active_count - 1) as f32 * gap_size } else { 0.0 };
             let usable_width = total_width - total_gaps;
@@ -113,13 +120,13 @@ impl BreakdownComponent {
             w_input: widths[0],
             total_output,
             p_output,
-            w_output: widths[1],
+            w_output: 0.0,
             total_cache,
             p_cache,
-            w_cache: 0.0, // cache 不在比例条中展示，作为独立指标
+            w_cache: widths[1],
             total_reasoning,
             p_reasoning,
-            w_reasoning: widths[2],
+            w_reasoning: 0.0,
         };
     }
 

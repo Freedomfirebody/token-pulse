@@ -405,6 +405,7 @@ impl DatasourceProvider for ClaudeCollector {
         let mut datalogs = Vec::new();
         for (_, entry) in deduped_map {
             let model = entry.model.unwrap_or_else(|| "claude-sonnet".to_string());
+            let cache = entry.usage.cache_creation_input_tokens + entry.usage.cache_read_input_tokens;
             datalogs.push(Datalog {
                 source_name: SourceName::CloudeCode,
                 collected_at: Utc::now(),
@@ -416,9 +417,9 @@ impl DatasourceProvider for ClaudeCollector {
                 source_parent_project: Some(entry.session_id), // 把 session_id 作为父级关联
                 source_report_class: ReportClass::Official,
                 token_info: TokenInfo {
-                    input: entry.usage.input_tokens,
+                    input: entry.usage.input_tokens.saturating_sub(cache),
                     output: entry.usage.output_tokens,
-                    cache: entry.usage.cache_creation_input_tokens + entry.usage.cache_read_input_tokens,
+                    cache,
                     resourcing: 0,
                     reasoning: 0,
                 },
@@ -466,6 +467,7 @@ impl DatasourceProvider for ClaudeCollector {
         let mut datalogs = Vec::new();
         for (_, entry) in deduped_map {
             let model = entry.model.unwrap_or_else(|| "claude-sonnet".to_string());
+            let cache = entry.usage.cache_creation_input_tokens + entry.usage.cache_read_input_tokens;
             datalogs.push(Datalog {
                 source_name: SourceName::CloudeCode,
                 collected_at: Utc::now(),
@@ -477,9 +479,9 @@ impl DatasourceProvider for ClaudeCollector {
                 source_parent_project: Some(entry.session_id),
                 source_report_class: ReportClass::Official,
                 token_info: TokenInfo {
-                    input: entry.usage.input_tokens,
+                    input: entry.usage.input_tokens.saturating_sub(cache),
                     output: entry.usage.output_tokens,
-                    cache: entry.usage.cache_creation_input_tokens + entry.usage.cache_read_input_tokens,
+                    cache,
                     resourcing: 0,
                     reasoning: 0,
                 },

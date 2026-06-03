@@ -104,7 +104,7 @@ impl AntigravityCollector {
             source_name,
             store: Arc::new(Mutex::new(IngestStore::new(data_dir))),
             transcript_offsets: Arc::new(Mutex::new(HashMap::new())),
-            rpc_timeout: Duration::from_secs(15),
+            rpc_timeout: Duration::from_secs(120), // 针对超大 RPC 报文支持长超时 (120 秒)
         }
     }
 
@@ -179,16 +179,25 @@ impl AntigravityCollector {
 
                 // 发现 sessions：RPC 列表 + brain 目录取并集
                 let rpc_sessions = client.list_trajectories(conn).await;
-                let mut session_ids: Vec<String> = rpc_sessions.iter()
-                    .map(|s| s.session_id.clone())
-                    .collect();
-
-                let brain_ids = scan_brain_session_ids(&session_root);
-                for id in brain_ids {
-                    if !session_ids.contains(&id) {
-                        session_ids.push(id);
+                
+                // 将所有 session 统一组织为：session_id -> mtime 映射
+                let mut session_mtimes = std::collections::HashMap::new();
+                for s in &rpc_sessions {
+                    if let Some(ms) = s.last_modified_ms {
+                        session_mtimes.insert(s.session_id.clone(), ms);
                     }
                 }
+                
+                // 扫描 brain 并集，包含本地文件夹最后修改时间
+                let brain_sessions = scan_brain_sessions(&session_root);
+                for (id, mtime) in brain_sessions {
+                    // 如果 RPC 已经提供了修改时间，以 RPC 为准，否则使用本地文件夹修改时间
+                    session_mtimes.entry(id).or_insert(mtime);
+                }
+
+                // 排序，保证稳定性
+                let mut session_ids: Vec<String> = session_mtimes.keys().cloned().collect();
+                session_ids.sort();
 
                 info!(
                     rpc_count = rpc_sessions.len(),
@@ -196,20 +205,42 @@ impl AntigravityCollector {
                     "CLI ingest: session 发现完成"
                 );
 
-                // 对每个 session 增量分段拉取
+                // 对每个 session 增量拉取
                 for (idx, session_id) in session_ids.iter().enumerate() {
                     let start_offset = store.lock().session_offset(session_id);
                     let step_hint = rpc_sessions.iter()
                         .find(|s| s.session_id == *session_id)
                         .and_then(|s| s.step_count)
-                        .unwrap_or(5000);
+                        .unwrap_or_else(|| {
+                            // 从本地 transcript.jsonl 的行数中精准读取实际步数
+                            let transcript_path = session_root
+                                .join("brain")
+                                .join(session_id)
+                                .join(".system_generated")
+                                .join("logs")
+                                .join("transcript.jsonl");
+                            count_transcript_steps(&transcript_path).unwrap_or(20)
+                        });
 
+                    // 获取本次最新的修改时间
+                    let rpc_mtime = session_mtimes.get(session_id).copied().unwrap_or(0);
+                    let stored_mtime = store.lock().session_modified_time(session_id);
+
+                    // 如果最新修改时间不为 0，且不大于我们持久化记录的时间，说明没有更新，直接跳过！
+                    if rpc_mtime > 0 && stored_mtime > 0 && rpc_mtime <= stored_mtime {
+                        tracing::trace!(session_id, rpc_mtime, stored_mtime, "会话无更新，跳过数据拉取");
+                        rpc_session_ids.insert(session_id.clone());
+                        continue;
+                    }
+
+                    let est_secs = 0.24 + (step_hint as f64 * 0.0012) + (step_hint as f64).powi(2) * 0.0000003;
                     if start_offset == 0 && step_hint > 0 {
                         info!(
                             progress = format!("{}/{}", idx + 1, session_ids.len()),
                             session_id,
                             step_hint,
-                            "CLI ingest: 开始采集 session"
+                            "CLI ingest: 开始采集 session (预计耗时: {:.1} 秒)",
+                            est_secs
                         );
                     }
 
@@ -218,12 +249,15 @@ impl AntigravityCollector {
                         source_name, &store,
                     ).await;
 
-                    if fetched > 0 {
-                        rpc_session_ids.insert(session_id.clone());
+                    if fetched > 0 || rpc_mtime > stored_mtime {
+                        if rpc_mtime > 0 {
+                            store.lock().update_session_modified_time(session_id, rpc_mtime);
+                        }
                     }
+                    rpc_session_ids.insert(session_id.clone());
                 }
 
-                // 刷盘 session offsets
+                // 刷盘 session offsets 和 modified times
                 store.lock().flush();
             }
 
@@ -258,112 +292,69 @@ impl AntigravityCollector {
         source_name: SourceName,
         store: &Arc<Mutex<IngestStore>>,
     ) -> usize {
-        let mut offset = start_offset;
-        let mut total_fetched = 0usize;
-        let mut batch_count = 0u32;
-        let mut current_batch_size = BATCH_SIZE; // 安全起始大小，避免 200 导致 local server 超时挂起
-        let mut consecutive_failures = 0;
-
-        loop {
-            // 已超过已知步数上限 → 停止
-            if offset >= step_hint {
-                break;
-            }
-
-            let end = offset + current_batch_size;
-            match client.get_trajectory_steps_paged(conn, session_id, offset, end).await {
-                Ok(steps) => {
-                    consecutive_failures = 0; // 重置连续失败计数
-                    if steps.is_empty() { break; }
-
-                    // 如果成功且分片较小，逐步增大分片以提高速度（上限 100）
-                    if current_batch_size < 100 {
-                        current_batch_size = (current_batch_size + 10).min(100);
-                    }
-
-                    // 首批首个 step: 打印 JSON 结构用于诊断
-                    if batch_count == 0 {
-                        if let Some(first) = steps.first() {
-                            let keys: Vec<&str> = first.as_object()
-                                .map(|o| o.keys().map(|k| k.as_str()).collect())
-                                .unwrap_or_default();
-                            info!(
-                                session_id,
-                                keys = ?keys,
-                                "CLI ingest: 首个 step JSON keys"
-                            );
-                        }
-                    }
-                    batch_count += 1;
-
-                    let metadata: Vec<GeneratorMetadata> = steps.iter().enumerate()
-                        .filter_map(|(i, step)| {
-                            GeneratorMetadata::from_step_json(step, offset + i as u32)
-                        })
-                        .collect();
-
-                    let batch_meta_count = metadata.len();
-                    if !metadata.is_empty() {
-                        let datalogs = metadata_to_datalogs(source_name, session_id, &metadata);
-                        total_fetched += datalogs.len();
-                        store.lock().append(datalogs);
-                    }
-
-                    let batch_len = steps.len() as u32;
-                    offset += batch_len;
-                    store.lock().advance_session_offset(session_id, offset);
-
-                    // 仅前几批打印详细日志，后续静默
-                    if batch_count <= 3 || batch_meta_count > 0 {
-                        info!(
-                            session_id,
-                            batch_steps = batch_len,
-                            batch_metadata = batch_meta_count,
-                            offset,
-                            current_batch_size,
-                            "CLI ingest: batch 完成"
-                        );
-                    }
+        // 调用我们刚添加的 get_generator_metadata 函数进行全量拉取
+        match client.get_generator_metadata(conn, session_id, step_hint).await {
+            Ok(raw_list) => {
+                if raw_list.is_empty() {
+                    return 0;
                 }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!(
+
+                // 解析为 GeneratorMetadata 结构
+                let mut all_metadata: Vec<GeneratorMetadata> = raw_list.iter()
+                    .filter_map(|val| GeneratorMetadata::from_rpc_json(val))
+                    .collect();
+
+                // 按步骤索引排序，保证增量偏移顺序
+                all_metadata.sort_by_key(|m| m.step_indices.first().copied().unwrap_or(0));
+
+                // 增量过滤：如果全部步骤索引都小于 start_offset，则过滤掉
+                let filtered_metadata: Vec<GeneratorMetadata> = all_metadata.iter()
+                    .filter(|m| {
+                        m.step_indices.is_empty() || m.step_indices.iter().any(|&idx| idx >= start_offset)
+                    })
+                    .cloned()
+                    .collect();
+
+                let fetched_count = filtered_metadata.len();
+
+                if fetched_count > 0 {
+                    // 转换为 datalogs 并追加到本地 store
+                    let datalogs = metadata_to_datalogs(source_name, session_id, &filtered_metadata);
+                    store.lock().append(datalogs);
+                }
+
+                // 根据所有已存在的最大 step index 推进 offset 游标
+                let next_offset = all_metadata.iter()
+                    .flat_map(|m| &m.step_indices)
+                    .max()
+                    .copied()
+                    .map(|idx| idx + 1)
+                    .unwrap_or(start_offset);
+
+                if next_offset > start_offset {
+                    store.lock().advance_session_offset(session_id, next_offset);
+                    info!(
                         session_id,
-                        offset,
-                        current_batch_size,
-                        failures = consecutive_failures,
-                        error = %e,
-                        "CLI 分段步骤获取失败，尝试减小分片大小"
+                        total_metadata = raw_list.len(),
+                        new_metadata = fetched_count,
+                        start_offset,
+                        new_offset = next_offset,
+                        "CLI ingest: 全量元数据采集完成 (自适应超时)"
                     );
-
-                    if current_batch_size > 5 {
-                        // 动态减半并设置不小于 5 的重试分片
-                        current_batch_size = (current_batch_size / 2).max(5);
-                        info!(
-                            session_id,
-                            offset,
-                            new_batch_size = current_batch_size,
-                            "调整分片大小以重新尝试"
-                        );
-                        // 给本地 language server 0.5s 恢复喘息时间
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    } else {
-                        warn!(
-                            session_id,
-                            offset,
-                            "最小分片下获取仍失败，停止当前 session"
-                        );
-                        break;
-                    }
                 }
+
+                fetched_count
+            }
+            Err(e) => {
+                warn!(
+                    session_id,
+                    start_offset,
+                    error = %e,
+                    "CLI 全量元数据采集失败"
+                );
+                0
             }
         }
-
-        if total_fetched > 0 || offset > start_offset {
-            info!(session_id, total_fetched, offset, "CLI session steps 流式采集完成");
-        }
-
-        total_fetched
     }
 }
 
@@ -427,24 +418,41 @@ fn metadata_to_datalogs(
     }).collect()
 }
 
-/// 扫描 brain 目录获取所有 session_id
-fn scan_brain_session_ids(session_root: &Path) -> Vec<String> {
+/// 扫描 brain 目录获取所有 session_id 以及上次修改时间（毫秒级时间戳）
+fn scan_brain_sessions(session_root: &Path) -> Vec<(String, u64)> {
     let brain_dir = session_root.join("brain");
     if !brain_dir.exists() { return vec![]; }
 
-    let mut ids = Vec::new();
+    let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&brain_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.len() >= 32 && name.contains('-') {
-                    ids.push(name);
+                    let mut mtime = 0;
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(duration) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                                mtime = duration.as_millis() as u64;
+                            }
+                        }
+                    }
+                    sessions.push((name, mtime));
                 }
             }
         }
     }
-    ids
+    sessions
 }
+
+/// 计算本地 transcript.jsonl 的行数作为实际步数
+fn count_transcript_steps(path: &Path) -> Option<u32> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    Some(reader.lines().count() as u32)
+}
+
 
 // ===== Transcript 降级路径 =====
 
@@ -562,22 +570,22 @@ fn parse_transcript_file(
                 let or_ = usage.get("thoughts_token_count").and_then(|v| v.as_u64());
 
                 if let (Some(inp), Some(out)) = (oi, oo) {
-                    input = inp;
-                    output = out;
                     cache = oc.unwrap_or(0);
+                    input = inp.saturating_sub(cache);
+                    output = out;
                     reasoning = or_.unwrap_or(0);
                     report_class = ReportClass::Official;
                 } else {
                     output = estimator.estimate_text(content_str);
                     reasoning = estimator.estimate_text(thinking_str);
-                    input = 500 + cumulative_tokens;
                     cache = tokens_at_last_model;
+                    input = (500 + cumulative_tokens).saturating_sub(cache);
                 }
             } else {
                 output = estimator.estimate_text(content_str);
                 reasoning = estimator.estimate_text(thinking_str);
-                input = 500 + cumulative_tokens;
                 cache = tokens_at_last_model;
+                input = (500 + cumulative_tokens).saturating_sub(cache);
             }
 
             if input > 0 || output > 0 || cache > 0 || reasoning > 0 {

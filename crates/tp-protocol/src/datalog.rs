@@ -66,15 +66,10 @@ pub struct TokenInfo {
     /// 推理/思考 token 数
     pub reasoning: u64,
 }
-
 impl TokenInfo {
-    /// 所有维度的总计 (Gemini API: total_token_count = prompt + candidates + thoughts)
-    ///
-    /// - `input` (prompt_token_count): 包含缓存命中的 token（cache 是 input 的子集）
-    /// - `output` (candidates_token_count): 不包含思考 token
-    /// - `reasoning` (thoughts_token_count): 思考/推理 token
     pub fn total(&self) -> u64 {
         self.input
+            .saturating_add(self.cache)
             .saturating_add(self.output)
             .saturating_add(self.reasoning)
     }
@@ -269,7 +264,7 @@ mod tests {
         a.accumulate(&b);
         assert_eq!(a.input, 150);
         assert_eq!(a.output, 300);
-        assert_eq!(a.total(), 495);
+        assert_eq!(a.total(), 570);
     }
 
     #[test]

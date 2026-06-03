@@ -194,5 +194,76 @@ impl RpcClient {
 
         Ok(steps)
     }
+
+    /// 获取指定会话的全部 LLM Generator 元数据（全量获取，支持根据步数算超长超时）
+    pub async fn get_generator_metadata(
+        &self,
+        conn: &RpcConnection,
+        session_id: &str,
+        step_count_hint: u32,
+    ) -> Result<Vec<Value>, String> {
+        let body = serde_json::json!({
+            "cascadeId": session_id
+        });
+
+        // 依据我们拟合的数学关系动态估算超时依据，避免大报文超时
+        // Timeout = Max(30, int(0.038 * step_count + 30))
+        let dynamic_secs = ((step_count_hint as f64 * 0.038) + 30.0).max(30.0).min(600.0) as u64;
+        let dynamic_timeout = Duration::from_secs(dynamic_secs);
+
+        let client = if dynamic_timeout > self.timeout {
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .timeout(dynamic_timeout)
+                .build()
+                .unwrap_or_else(|_| self.http.clone())
+        } else {
+            self.http.clone()
+        };
+
+        let url = format!(
+            "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
+            conn.port
+        );
+
+        trace!(session_id, step_count_hint, seconds = dynamic_secs, "RPC 发送全量元数据请求 (动态自适应超时)");
+
+        let resp = client.post(&url)
+            .header("Content-Type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .header("X-Codeium-Csrf-Token", &conn.csrf_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                let mut msg = format!("RPC 全量元数据请求失败: {e}");
+                let mut source = std::error::Error::source(&e);
+                while let Some(cause) = source {
+                    msg.push_str(&format!(" → {cause}"));
+                    source = std::error::Error::source(cause);
+                }
+                msg
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("RPC 响应错误 HTTP {status}: {body_text}"));
+        }
+
+        let text = resp.text().await.map_err(|e| format!("读取响应失败: {e}"))?;
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let val: Value = serde_json::from_str(&text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+
+        let list = val.get("generatorMetadata")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(list)
+    }
 }
 
