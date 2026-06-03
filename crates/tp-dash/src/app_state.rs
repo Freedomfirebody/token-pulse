@@ -954,7 +954,7 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     // Common Header Bar View for Single
     let header_bar_single = flex_row((
         flex_row((
-            label("ANTIGRAVITY TOKEN MONITOR")
+            label("TOKEN MONITOR")
                 .text_size(theme::FONT_SIZE_TITLE)
                 .color(theme::TEXT_CYAN),
             FlexSpacer::Fixed(10.0_f32.px()),
@@ -985,7 +985,7 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     // Common Header Bar View for Dual
     let header_bar_dual = flex_row((
         flex_row((
-            label("ANTIGRAVITY TOKEN MONITOR")
+            label("TOKEN MONITOR")
                 .text_size(theme::FONT_SIZE_TITLE)
                 .color(theme::TEXT_CYAN),
             FlexSpacer::Fixed(10.0_f32.px()),
