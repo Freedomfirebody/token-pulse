@@ -58,6 +58,8 @@ pub struct GeneratorMetadata {
     pub response_tokens: u64,
     /// LLM 调用时间戳
     pub timestamp: Option<DateTime<Utc>>,
+    /// 原始会话（父会话）ID
+    pub parent_trajectory_id: Option<String>,
 }
 
 impl GeneratorMetadata {
@@ -102,6 +104,12 @@ impl GeneratorMetadata {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
+        // 解析原始会话（父会话）ID
+        let parent_trajectory_id = chat_model.get("customMetadata")
+            .and_then(|c| c.get("trajectory_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Some(Self {
             step_indices,
             model,
@@ -112,6 +120,7 @@ impl GeneratorMetadata {
             thinking_tokens,
             response_tokens,
             timestamp,
+            parent_trajectory_id,
         })
     }
 
@@ -148,6 +157,12 @@ impl GeneratorMetadata {
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse::<DateTime<Utc>>().ok());
 
+                    // 解析原始会话（父会话）ID
+                    let parent_trajectory_id = metadata.get("customMetadata")
+                        .and_then(|c| c.get("trajectory_id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+
                     return Some(Self {
                         step_indices: vec![step_index],
                         model: model.clone(),
@@ -158,6 +173,7 @@ impl GeneratorMetadata {
                         thinking_tokens,
                         response_tokens,
                         timestamp,
+                        parent_trajectory_id,
                     });
                 }
             }
@@ -246,6 +262,7 @@ impl GeneratorMetadata {
             thinking_tokens,
             response_tokens,
             timestamp,
+            parent_trajectory_id: None,
         })
     }
 }

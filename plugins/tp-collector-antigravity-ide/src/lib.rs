@@ -149,7 +149,7 @@ impl AntigravityIdeCollector {
                     let fetched = stream_session_steps(
                         &client, conn, session_id, start_offset,
                         step_hint,
-                        source_name, &store,
+                        source_name, &store, &session_root,
                     ).await;
 
                     if fetched > 0 || *rpc_mtime > stored_mtime {
@@ -201,6 +201,7 @@ async fn stream_session_steps(
     step_hint: u32,
     source_name: SourceName,
     store: &Arc<Mutex<IngestStore>>,
+    session_root: &Path,
 ) -> usize {
     // 调用我们刚添加的 get_generator_metadata 函数进行全量拉取
     match client.get_generator_metadata(conn, session_id, step_hint).await {
@@ -228,8 +229,19 @@ async fn stream_session_steps(
             let fetched_count = filtered_metadata.len();
 
             if fetched_count > 0 {
+                // 检测本地 transcript 是否有父会话映射，作为降级/备用 parent_id 覆盖
+                let parent_id_override = {
+                    let transcript_path = session_root
+                        .join("brain")
+                        .join(session_id)
+                        .join(".system_generated")
+                        .join("logs")
+                        .join("transcript.jsonl");
+                    find_parent_session_id_in_transcript(&transcript_path, session_id)
+                };
+
                 // 转换为 datalogs 并追加到本地 store
-                let datalogs = metadata_to_datalogs(source_name, session_id, &filtered_metadata);
+                let datalogs = metadata_to_datalogs(source_name, session_id, &filtered_metadata, parent_id_override);
                 store.lock().append(datalogs);
             }
 
@@ -271,6 +283,7 @@ fn metadata_to_datalogs(
     source_name: SourceName,
     session_id: &str,
     metadata: &[GeneratorMetadata],
+    parent_id_override: Option<String>,
 ) -> Vec<Datalog> {
     metadata.iter().filter_map(|m| {
         let model = model_aliases::resolve_model_placeholder(&m.response_model)
@@ -280,11 +293,16 @@ fn metadata_to_datalogs(
 
         let timestamp = m.timestamp.unwrap_or_else(Utc::now);
 
+        // 如果 GeneratorMetadata 中包含 parent_trajectory_id，或者有传入的 parent_id_override，优先作为 source_project 写入
+        let project = m.parent_trajectory_id.clone()
+            .or_else(|| parent_id_override.clone())
+            .unwrap_or_else(|| session_id.to_string());
+
         Some(Datalog {
             source_name,
             collected_at: Utc::now(),
             source_api_key: None,
-            source_project: session_id.to_string(),
+            source_project: project,
             source_model: model,
             source_datetime: timestamp,
             source_through_time: Duration::from_secs(0),
@@ -334,4 +352,103 @@ fn count_transcript_steps(path: &Path) -> Option<u32> {
     let reader = std::io::BufReader::new(file);
     Some(reader.lines().count() as u32)
 }
+
+/// 从本地 transcript.jsonl 的前几行（主要是首行 USER_INPUT）中解析父会话 ID (UUID)
+fn find_parent_session_id_in_transcript(path: &Path, exclude_session_id: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    // 只需要检查前 5 行即可，主会话 ID 通常在首行 USER_INPUT 的 content 中
+    for line_res in reader.lines().take(5) {
+        if let Ok(line) = line_res {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
+                    if let Some(uuid) = find_uuid_in_text(content, exclude_session_id) {
+                        return Some(uuid);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 在文本中查找第一个符合 UUID 格式的 36 字符子串，且其前面包含 conversation/orchestrator/parent 关键字
+fn find_uuid_in_text(text: &str, exclude: &str) -> Option<String> {
+    let text_lower = text.to_lowercase();
+    let keywords = ["conversation id", "conversationid", "conversation", "orchestrator", "parent"];
+    
+    for kw in &keywords {
+        let mut start_idx = 0;
+        while let Some(pos) = text_lower[start_idx..].find(kw) {
+            let abs_pos = start_idx + pos;
+            let search_start = abs_pos + kw.len();
+            let search_end = std::cmp::min(text.len(), search_start + 150);
+            if search_start < search_end {
+                let chunk = &text[search_start..search_end];
+                if let Some(uuid) = extract_uuid_with_exclude(chunk, exclude) {
+                    return Some(uuid);
+                }
+            }
+            start_idx = abs_pos + kw.len();
+        }
+    }
+    None
+}
+
+fn extract_uuid_with_exclude(s: &str, exclude: &str) -> Option<String> {
+    if s.len() < 36 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    for i in 0..=(bytes.len() - 36) {
+        if bytes[i + 8] == b'-' && bytes[i + 13] == b'-' && bytes[i + 18] == b'-' && bytes[i + 23] == b'-' {
+            let mut is_uuid = true;
+            for j in 0..36 {
+                if j == 8 || j == 13 || j == 18 || j == 23 {
+                    continue;
+                }
+                let b = bytes[i + j];
+                if !b.is_ascii_hexdigit() {
+                    is_uuid = false;
+                    break;
+                }
+            }
+            if is_uuid {
+                let candidate = s[i..i + 36].to_string();
+                if candidate != exclude {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_uuid_in_text() {
+        let text1 = "message the Project Orchestrator (conversation ID: bd6e0c16-c624-409c-bb66-d321a9e2ebdc) with a summary.";
+        let res1 = find_uuid_in_text(text1, "80ba9cf0-0186-4588-95dd-0e8f617996bf");
+        assert_eq!(res1, Some("bd6e0c16-c624-409c-bb66-d321a9e2ebdc".to_string()));
+
+        let text2 = "Action: Report back to parent conversation ID f185943d-9b3c-4b67-ad7a-078324d96179 once complete.";
+        let res2 = find_uuid_in_text(text2, "80ba9cf0-0186-4588-95dd-0e8f617996bf");
+        assert_eq!(res2, Some("f185943d-9b3c-4b67-ad7a-078324d96179".to_string()));
+
+        // Test exclusion
+        let text3 = "conversation ID: 80ba9cf0-0186-4588-95dd-0e8f617996bf, parent: f185943d-9b3c-4b67-ad7a-078324d96179";
+        let res3 = find_uuid_in_text(text3, "80ba9cf0-0186-4588-95dd-0e8f617996bf");
+        assert_eq!(res3, Some("f185943d-9b3c-4b67-ad7a-078324d96179".to_string()));
+    }
+}
+
 
