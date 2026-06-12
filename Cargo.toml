@@ -49,6 +49,13 @@ sha1 = "0.11"
 
 # ── UI (Xilem + Linebender stack) ──
 xilem = "0.4"
+tray-icon = "0.19"
+image = { version = "0.25", default-features = false, features = ["png"] }
+winit = { version = "0.30", default-features = false }
+masonry = "0.4"
+masonry_winit = "0.4"
+softbuffer = "0.4"
+tiny-skia = "0.11"
 
 # ── Internal crates ──
 tp-protocol = { path = "crates/tp-protocol" }
@@ -94,3 +101,11 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 xilem.workspace = true
+tray-icon.workspace = true
+image.workspace = true
+winit.workspace = true
+masonry.workspace = true
+masonry_winit.workspace = true
+softbuffer = { workspace = true }
+tiny-skia = { workspace = true }
+sysinfo = { workspace = true }

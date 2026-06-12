@@ -12,3 +12,5 @@ tokio.workspace = true
 tracing.workspace = true
 xilem.workspace = true
 dirs.workspace = true
+tray-icon.workspace = true
+image.workspace = true

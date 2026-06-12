@@ -21,7 +21,6 @@ impl RpcClient {
     /// 使用 rustls TLS 后端，不验证服务器证书（language_server 使用自签名证书）。
     pub fn new(timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
             .timeout(timeout)
             .build()
             .expect("构建 HTTP 客户端失败");
@@ -87,7 +86,6 @@ impl RpcClient {
 
         // 心跳使用独立的短超时客户端
         let short_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
             .connect_timeout(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -213,7 +211,6 @@ impl RpcClient {
 
         let client = if dynamic_timeout > self.timeout {
             reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
                 .timeout(dynamic_timeout)
                 .build()
                 .unwrap_or_else(|_| self.http.clone())

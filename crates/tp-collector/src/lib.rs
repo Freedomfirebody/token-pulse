@@ -294,7 +294,7 @@ mod tests {
     /// 基本功能: collect_once 串行采集，数据正确到达 channel
     #[tokio::test]
     async fn test_collect_once() {
-        let (tx, mut rx) = mpsc::channel(100);
+        let (tx, _rx) = mpsc::channel(100);
         let coordinator = CollectorCoordinator::new(tx);
 
         // 空采集

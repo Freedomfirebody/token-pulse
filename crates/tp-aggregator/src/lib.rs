@@ -346,6 +346,7 @@ impl DataShow {
             hourly_today_by_source,
             project_sources,
             model_sources,
+            memory_warning: cached_view.memory_warning.clone(),
         })
     }
 

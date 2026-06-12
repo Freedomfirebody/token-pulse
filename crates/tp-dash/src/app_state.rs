@@ -389,6 +389,7 @@ fn filter_view(view: &DashboardView, tab: DashTab) -> DashboardView {
                 hourly_today_by_source,
                 project_sources,
                 model_sources,
+                memory_warning: view.memory_warning.clone(),
             }
         }
     }
@@ -936,6 +937,7 @@ fn dual_part_3(state: &mut AppState) -> impl WidgetView<AppState> {
 
 /// Xilem 应用主入口 — 根据 AppState 构建视图树
 pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
+    let memory_warning = state.filtered_view.memory_warning.clone();
     let view = &state.filtered_view;
 
     let termination_str = if let Some(ref key) = view.cache_termination_key {
@@ -1018,8 +1020,33 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     let p2_single = single_part_2(state);
     let p3_single = single_part_3(state);
 
+    let warning_banner_single = if let Some(ref warning_msg) = memory_warning {
+        Either::A(
+            flex_col((
+                sized_box(
+                    flex_row((
+                        label(warning_msg.clone())
+                            .text_size(theme::FONT_SIZE_BODY)
+                            .color(theme::COLOR_WARNING),
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                    .main_axis_alignment(MainAxisAlignment::Center)
+                )
+                .expand_width()
+                .background_color(theme::COLOR_ERROR)
+                .corner_radius(4.0)
+                .padding(xilem::style::Padding::from_vh(8.0, 16.0)),
+                FlexSpacer::Fixed(10.0_f32.px()),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+        )
+    } else {
+        Either::B(sized_box(label("")).width(0.0_f32.px()).height(0.0_f32.px()))
+    };
+
     let main_content_without_header_single = flex_col((
         p1_single,
+        warning_banner_single,
         p2_single,
         p3_single,
     ))
@@ -1041,8 +1068,33 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
     let p2_dual = dual_part_2(state);
     let p3_dual = dual_part_3(state);
 
+    let warning_banner_dual = if let Some(ref warning_msg) = memory_warning {
+        Either::A(
+            flex_col((
+                sized_box(
+                    flex_row((
+                        label(warning_msg.clone())
+                            .text_size(theme::FONT_SIZE_BODY)
+                            .color(theme::COLOR_WARNING),
+                    ))
+                    .cross_axis_alignment(CrossAxisAlignment::Center)
+                    .main_axis_alignment(MainAxisAlignment::Center)
+                )
+                .expand_width()
+                .background_color(theme::COLOR_ERROR)
+                .corner_radius(4.0)
+                .padding(xilem::style::Padding::from_vh(8.0, 16.0)),
+                FlexSpacer::Fixed(10.0_f32.px()),
+            ))
+            .cross_axis_alignment(CrossAxisAlignment::Fill)
+        )
+    } else {
+        Either::B(sized_box(label("")).width(0.0_f32.px()).height(0.0_f32.px()))
+    };
+
     let main_content_without_header_dual = flex_col((
         p1_dual,
+        warning_banner_dual,
         p2_dual,
         p3_dual,
     ))

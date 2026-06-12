@@ -35,7 +35,7 @@ impl ProcessLocator {
         #[cfg(target_os = "windows")]
         {
             let mut wmi_candidates = Vec::new();
-            let output = Command::new("powershell")
+            let output = Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
                 .arg("-NoProfile")
                 .arg("-Command")
                 .arg("Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*language_server*' -or $_.Name -like '*antigravity*' } | Select-Object ProcessId, Name, CommandLine, ExecutablePath | ConvertTo-Json -Compress")
@@ -129,7 +129,7 @@ impl ProcessLocator {
 
         // sysinfo 回退路径（所有平台通用）
         let mut sys = System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
 
         let mut candidates = Vec::new();
 
@@ -320,7 +320,7 @@ impl PortLocator {
         #[cfg(target_os = "windows")]
         {
             let mut ports = std::collections::BTreeSet::new();
-            if let Ok(output) = Command::new("netstat").arg("-ano").output() {
+            if let Ok(output) = Command::new("C:\\Windows\\System32\\netstat.exe").arg("-ano").output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
                     let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -355,7 +355,7 @@ impl PortLocator {
 
             let mut ports = std::collections::BTreeSet::new();
             for cmd_str in commands {
-                if let Ok(output) = Command::new("sh").arg("-c").arg(&cmd_str).output() {
+                if let Ok(output) = Command::new("/bin/sh").arg("-c").arg(&cmd_str).output() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     for port in parse_ports_from_output(&stdout) {
                         ports.insert(port);

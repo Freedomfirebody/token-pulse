@@ -110,6 +110,10 @@ pub struct DashboardView {
     pub project_sources: std::collections::HashMap<String, std::collections::HashSet<SourceName>>,
     #[serde(default)]
     pub model_sources: std::collections::HashMap<String, std::collections::HashSet<SourceName>>,
+
+    /// 内存超限警告信息
+    #[serde(default)]
+    pub memory_warning: Option<String>,
 }
 
 /// 每日统计
@@ -176,6 +180,55 @@ impl Default for DashboardView {
             hourly_today_by_source: BTreeMap::new(),
             project_sources: std::collections::HashMap::new(),
             model_sources: std::collections::HashMap::new(),
+            memory_warning: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dashboard_view_memory_warning_serialization() {
+        let mut view = DashboardView::default();
+        view.memory_warning = Some("⚠️ languageService 内存占用过大 (3.4 GB)".to_string());
+
+        let serialized = serde_json::to_string(&view).unwrap();
+        let deserialized: DashboardView = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            deserialized.memory_warning,
+            Some("⚠️ languageService 内存占用过大 (3.4 GB)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dashboard_view_memory_warning_backwards_compatibility() {
+        // A json string representing old view data without the memory_warning field
+        let json_data = r#"{
+            "total_tokens": {"input": 0, "output": 0, "cache": 0, "resourcing": 0, "reasoning": 0},
+            "today_tokens": {"input": 0, "output": 0, "cache": 0, "resourcing": 0, "reasoning": 0},
+            "week_tokens": {"input": 0, "output": 0, "cache": 0, "resourcing": 0, "reasoning": 0},
+            "month_tokens": {"input": 0, "output": 0, "cache": 0, "resourcing": 0, "reasoning": 0},
+            "total_cost": 0.0,
+            "today_cost": 0.0,
+            "week_cost": 0.0,
+            "month_cost": 0.0,
+            "record_count": 0,
+            "by_source": [],
+            "by_model": [],
+            "by_project": [],
+            "daily_series": {},
+            "hourly_today": {},
+            "recent_records": [],
+            "last_updated": "2026-06-11T14:27:00Z",
+            "source_status": [],
+            "daily_by_source": {},
+            "hourly_today_by_source": {}
+        }"#;
+
+        let deserialized: DashboardView = serde_json::from_str(json_data).unwrap();
+        assert!(deserialized.memory_warning.is_none());
     }
 }

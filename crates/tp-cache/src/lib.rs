@@ -368,6 +368,7 @@ impl DataCache {
             // New fields
             project_sources: snap.project_sources.clone(),
             model_sources: snap.model_sources.clone(),
+            memory_warning: None,
 
             // 元信息
             last_updated: now,
