@@ -7,9 +7,11 @@
 //! - session_offsets 持久化，避免重启后从 RPC 重新拉取全量步骤
 //! - consumer_cursors 持久化，但启动时重置为 0（因为 entries 是纯内存的）
 //! - `rebuild()` 清空所有状态（entries、cursors、session_offsets）
+//! - `append()` 触发 Notify 信号，让消费者立即响应
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tracing::{debug, warn};
 use tp_protocol::Datalog;
@@ -18,7 +20,7 @@ use tp_protocol::Datalog;
 ///
 /// 数据流：
 /// ```text
-/// 后台采集 → append(datalogs) → entries (内存)
+/// 后台采集 → append(datalogs) → entries (内存) → notify!
 ///                                    ↑
 /// 消费者   → pull("pool")    → entries[cursor..] (增量)
 /// ```
@@ -43,6 +45,9 @@ pub struct IngestStore {
 
     /// 脏标记 — 减少不必要的磁盘写入
     offsets_dirty: bool,
+
+    /// 数据到达通知器 — append() 时发信号，让消费者立即响应
+    append_notifier: Arc<tokio::sync::Notify>,
 }
 
 impl IngestStore {
@@ -77,15 +82,28 @@ impl IngestStore {
             session_modified_times,
             data_dir,
             offsets_dirty: false,
+            append_notifier: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     // ===== 写入端（后台采集任务调用）=====
 
-    /// 追加数据到内部存储
+    /// 追加数据到内部存储，并通知消费者
     pub fn append(&mut self, logs: Vec<Datalog>) {
         if logs.is_empty() { return; }
+        let count = logs.len();
         self.entries.extend(logs);
+        // 通知等待中的消费者：有新数据到达
+        self.append_notifier.notify_waiters();
+        tracing::trace!(count, total = self.entries.len(), "IngestStore: append + notify");
+    }
+
+    /// 获取 append 通知器的共享引用
+    ///
+    /// 消费者可通过 `notifier.notified().await` 等待新数据到达，
+    /// 配合 `tokio::select!` 实现即时响应 + 定时兜底的混合模式。
+    pub fn append_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.append_notifier.clone()
     }
 
     /// 获取指定 session 的当前 step offset
@@ -136,6 +154,7 @@ impl IngestStore {
     /// 增量拉取 — 返回该消费者自上次 pull 以来的新数据
     ///
     /// 游标自动推进到当前 entries 末尾。
+    /// 所有消费者都已消费的条目会被截断释放，防止 append-only 内存增长。
     pub fn pull(&mut self, consumer_id: &str) -> Vec<Datalog> {
         let cursor = self.cursors.get(consumer_id).copied().unwrap_or(0);
         let total = self.entries.len();
@@ -146,6 +165,21 @@ impl IngestStore {
 
         let new_data = self.entries[cursor..].to_vec();
         self.cursors.insert(consumer_id.to_string(), total);
+
+        // 截断已被所有消费者消费的 entries，释放内存
+        let min_cursor = self.cursors.values().copied().min().unwrap_or(0);
+        if min_cursor > 0 {
+            self.entries.drain(..min_cursor);
+            // 调整所有游标
+            for cursor_val in self.cursors.values_mut() {
+                *cursor_val -= min_cursor;
+            }
+            tracing::trace!(
+                truncated = min_cursor,
+                remaining = self.entries.len(),
+                "IngestStore: 截断已消费的 entries"
+            );
+        }
 
         // 持久化游标
         Self::save_json(
@@ -259,6 +293,10 @@ mod tests {
         let pulled = store.pull("A");
         assert_eq!(pulled.len(), 2);
 
+        // After pull, entries consumed by all registered consumers are truncated
+        // Only A is registered, and A consumed all 2 entries → entries drained
+        assert_eq!(store.len(), 0, "已消费条目应被截断释放");
+
         // Append batch 2
         store.append(vec![make_datalog("s2", 300)]);
 
@@ -266,9 +304,10 @@ mod tests {
         let pulled = store.pull("A");
         assert_eq!(pulled.len(), 1);
 
-        // Consumer B pulls → gets all 3 (first pull)
+        // Consumer B pulls → gets 0 (late joiner, all entries already truncated)
+        // 这是内存有界模式的正确行为：迟到消费者不能获取已截断的历史
         let pulled = store.pull("B");
-        assert_eq!(pulled.len(), 3);
+        assert_eq!(pulled.len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

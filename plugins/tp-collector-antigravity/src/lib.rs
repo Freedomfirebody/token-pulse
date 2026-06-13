@@ -188,10 +188,12 @@ impl AntigravityCollector {
                     }
                 }
                 
-                // 扫描 brain 并集，包含本地文件夹最后修改时间
+                // 扫描 brain 并集，发现 RPC 未覆盖的本地 session
+                // transcript.jsonl mtime 仅作为 RPC 不可用时的降级时间源
                 let brain_sessions = scan_brain_sessions(&session_root);
                 for (id, mtime) in brain_sessions {
-                    // 如果 RPC 已经提供了修改时间，以 RPC 为准，否则使用本地文件夹修改时间
+                    // RPC lastModifiedTime 是 language_server 维护的权威时间源，
+                    // 如果 RPC 已提供 mtime 则以 RPC 为准，否则使用本地 transcript.jsonl mtime
                     session_mtimes.entry(id).or_insert(mtime);
                 }
 
@@ -391,6 +393,14 @@ impl DatasourceProvider for AntigravityCollector {
     async fn health_check(&self) -> Result<bool, CollectionError> {
         Ok(self.session_root.join("brain").exists())
     }
+
+    /// 返回 IngestStore 的数据到达通知器
+    ///
+    /// 当后台 ingest_loop 通过 append() 写入新数据时，
+    /// 通知器会立即发出信号，让 framework 跳过等待定时器。
+    fn data_notifier(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.store.lock().append_notifier())
+    }
 }
 
 // ===== 共享辅助函数 =====
@@ -447,20 +457,42 @@ fn scan_brain_sessions(session_root: &Path) -> Vec<(String, u64)> {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.len() >= 32 && name.contains('-') {
-                    let mut mtime = 0;
-                    if let Ok(metadata) = entry.metadata() {
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(duration) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                                mtime = duration.as_millis() as u64;
-                            }
-                        }
-                    }
+                    // BUG FIX: 使用 transcript.jsonl 的文件 mtime 作为变更检测依据，
+                    // 而非 session 目录本身的 mtime。
+                    //
+                    // 原因：目录的 mtime 只有在直接子项增减时才会更新，
+                    // 但用户操作产生的数据写入的是深层嵌套的 transcript.jsonl，
+                    // 不会改变 session 目录自身的 mtime，导致已更新的 session 被跳过。
+                    let transcript_path = brain_dir
+                        .join(&name)
+                        .join(".system_generated")
+                        .join("logs")
+                        .join("transcript.jsonl");
+
+                    let mtime = file_mtime_ms(&transcript_path)
+                        .or_else(|| {
+                            // 降级：transcript.jsonl 不存在时使用目录 mtime
+                            entry.metadata().ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64)
+                        })
+                        .unwrap_or(0);
+
                     sessions.push((name, mtime));
                 }
             }
         }
     }
     sessions
+}
+
+/// 获取文件的修改时间（毫秒级 Unix 时间戳）
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
 }
 
 /// 计算本地 transcript.jsonl 的行数作为实际步数
@@ -498,25 +530,53 @@ fn find_parent_session_id_in_transcript(path: &Path, exclude_session_id: &str) -
 
 /// 在文本中查找第一个符合 UUID 格式的 36 字符子串，且其前面包含 conversation/orchestrator/parent 关键字
 fn find_uuid_in_text(text: &str, exclude: &str) -> Option<String> {
-    let text_lower = text.to_lowercase();
     let keywords = ["conversation id", "conversationid", "conversation", "orchestrator", "parent"];
     
+    // 统一在原始文本上操作，避免 to_lowercase() 导致字节长度不一致
+    let text_lower = text.to_lowercase();
+    
     for kw in &keywords {
-        let mut start_idx = 0;
-        while let Some(pos) = text_lower[start_idx..].find(kw) {
-            let abs_pos = start_idx + pos;
-            let search_start = abs_pos + kw.len();
-            let search_end = std::cmp::min(text.len(), search_start + 150);
+        let mut search_from = 0;
+        while search_from < text_lower.len() {
+            let Some(pos) = text_lower[search_from..].find(kw) else { break };
+            let abs_pos = search_from + pos;
+            let kw_end = abs_pos + kw.len();
+            
+            // 在原始 text 上安全切片：确保边界落在字符边界上
+            let search_start = snap_to_char_boundary(text, kw_end, true);
+            let raw_end = std::cmp::min(text.len(), search_start + 150);
+            let search_end = snap_to_char_boundary(text, raw_end, false);
+            
             if search_start < search_end {
                 let chunk = &text[search_start..search_end];
                 if let Some(uuid) = extract_uuid_with_exclude(chunk, exclude) {
                     return Some(uuid);
                 }
             }
-            start_idx = abs_pos + kw.len();
+            search_from = kw_end;
         }
     }
     None
+}
+
+/// 将字节索引调整到最近的 UTF-8 字符边界
+/// `forward = true` 时向后找（用于 start），`false` 时向前找（用于 end）
+fn snap_to_char_boundary(s: &str, byte_idx: usize, forward: bool) -> usize {
+    if byte_idx >= s.len() { return s.len(); }
+    if byte_idx == 0 { return 0; }
+    if s.is_char_boundary(byte_idx) { return byte_idx; }
+    
+    if forward {
+        // 向后找到下一个字符边界
+        let mut i = byte_idx;
+        while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+        i
+    } else {
+        // 向前找到上一个字符边界
+        let mut i = byte_idx;
+        while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+        i
+    }
 }
 
 fn extract_uuid_with_exclude(s: &str, exclude: &str) -> Option<String> {
@@ -706,7 +766,7 @@ fn parse_transcript_file(
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| model_raw.to_string());
 
-                info!(
+                tracing::trace!(
                     session_id,
                     step_idx,
                     model = ?model,

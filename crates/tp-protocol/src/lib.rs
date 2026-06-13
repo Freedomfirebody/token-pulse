@@ -6,6 +6,7 @@
 // Dummy comment to invalidate build cache and force rebuild of tp-protocol in workspace.
 
 pub mod datalog;
+pub mod digest;
 pub mod dimension;
 pub mod error;
 pub mod meta;
@@ -16,6 +17,7 @@ pub mod conversation;
 
 // ===== 顶级 re-export =====
 pub use datalog::{Datalog, DatalogUid, ReportClass, SourceName, TokenInfo};
+pub use digest::{ArchiveDigest, DigestGranularity};
 pub use dimension::{Dimension, TimeGranularity};
 pub use error::*;
 pub use meta::{MetaIndex, PartitionTier, PoolMetadata};
@@ -23,4 +25,5 @@ pub use traits::{CacheProvider, CacheUpdateSignal, DatasourceProvider, DataShowP
 pub use view::{DashboardView, DimensionEntry, SourceStatus};
 pub use pricing::{ModelPrice, PricingTable};
 pub use conversation::ConversationRegistry;
+
 

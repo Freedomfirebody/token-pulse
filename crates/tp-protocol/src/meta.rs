@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 存储分片层级
 ///
@@ -60,6 +60,22 @@ pub struct MetaIndex {
     /// 最后更新时间 (路径变更或数据追加)
     #[serde(with = "chrono::serde::ts_milliseconds")]
     pub updated_at: DateTime<Utc>,
+
+    /// 关联的快照块路径（归档后才有）
+    #[serde(default)]
+    pub digest_path: Option<PathBuf>,
+
+    /// 快照块是否有效（数据变更后标记为 false，需要重建）
+    #[serde(default = "default_digest_valid")]
+    pub digest_valid: bool,
+}
+
+/// 默认 digest_valid 值 — 新建或无 digest 时视为有效
+///
+/// 使用 true 作为默认值，这样旧的 MetaIndex（没有 digest_path）
+/// 不会被误标为无效。实际校验通过 `digest_path.is_some()` 判断。
+fn default_digest_valid() -> bool {
+    true
 }
 
 impl MetaIndex {
@@ -75,7 +91,25 @@ impl MetaIndex {
             last_record_at: None,
             created_at: now,
             updated_at: now,
+            digest_path: None,
+            digest_valid: true,
         }
+    }
+
+    /// 设置关联的快照块路径
+    pub fn set_digest(&mut self, path: &Path) {
+        self.digest_path = Some(path.to_path_buf());
+        self.digest_valid = true;
+    }
+
+    /// 标记快照块已失效（需要重建）
+    pub fn invalidate_digest(&mut self) {
+        self.digest_valid = false;
+    }
+
+    /// 检查是否有可用的快照块
+    pub fn has_valid_digest(&self) -> bool {
+        self.digest_path.is_some() && self.digest_valid
     }
 }
 

@@ -100,6 +100,12 @@ impl CollectorCoordinator {
                 let source_name = source.name();
                 let mut last_collected: Option<DateTime<Utc>> = None;
 
+                // 获取数据到达通知器（如果数据源支持推送模式）
+                let data_notify = source.data_notifier();
+                if data_notify.is_some() {
+                    info!(source = %source_name, "数据源支持推送通知，启用即时响应模式");
+                }
+
                 // 延迟 3 秒执行首次采集，让 UI 先顺利渲染显示
                 // 同时监听 cmd_rx，确保启动期间收到的 Rebuild/Upsert 不丢失
                 let mut startup_cmd_pending = false;
@@ -128,8 +134,24 @@ impl CollectorCoordinator {
                 let _ = startup_cmd_pending; // 已通过上面的 collect 执行
 
                 loop {
+                    // 构建异步等待：定时器 + 可选的推送通知
+                    let timer = tokio::time::sleep(interval);
+                    tokio::pin!(timer);
+
                     tokio::select! {
-                        _ = tokio::time::sleep(interval) => {
+                        _ = &mut timer => {
+                            let _ = collect_and_push(&source, &tx, &mut last_collected).await;
+                        }
+                        _ = async {
+                            // 如果有数据通知器，等待通知；否则永远 pending
+                            if let Some(ref notify) = data_notify {
+                                notify.notified().await;
+                            } else {
+                                // 无推送的数据源，此分支永不就绪
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            // 数据源有新数据到达，立即拉取
                             let _ = collect_and_push(&source, &tx, &mut last_collected).await;
                         }
                         cmd = cmd_rx.recv() => {

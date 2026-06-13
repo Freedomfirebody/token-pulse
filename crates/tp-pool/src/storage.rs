@@ -371,7 +371,17 @@ impl PoolStorage for DataPool {
                     daily_logs.sort_by_key(|l| l.source_datetime);
                     self.archive.write_daily(date_key, &daily_logs)?;
 
-                    // 更新元数据: Active → ArchiveDaily
+                    // 生成并保存 Digest — 预计算聚合结论
+                    let pricing = tp_protocol::PricingTable::builtin();
+                    let digest = tp_protocol::digest::ArchiveDigest::build_daily(
+                        date_key,
+                        &daily_logs,
+                        |model, token| pricing.calculate_cost(model, token),
+                    );
+                    let digest_path = self.archive.write_daily_digest(date_key, &digest)?;
+                    tracing::info!("日归档 Digest 已生成: {date_key}");
+
+                    // 更新元数据: Active → ArchiveDaily + Digest 路径
                     {
                         let mut meta = self.metadata.write();
                         let new_path = self
@@ -380,6 +390,10 @@ impl PoolStorage for DataPool {
                             .join("daily")
                             .join(format!("{date_key}.jsonl"));
                         meta.update_tier(hour_key, PartitionTier::ArchiveDaily, new_path);
+                        // 关联 digest 到该分区的所有 hour_key
+                        if let Some(idx) = meta.metadata_mut().indices.get_mut(hour_key) {
+                            idx.set_digest(&digest_path);
+                        }
                     }
 
                     // 删除活跃文件

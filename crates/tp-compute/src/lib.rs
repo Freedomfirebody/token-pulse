@@ -488,9 +488,153 @@ impl IncrementalAggregator {
         self.state.merge_from(&other.state);
     }
 
+    /// 从归档快照块 (ArchiveDigest) 合并预计算数据到聚合状态。
+    ///
+    /// 这是 Cache 冷启动加速的核心方法:
+    /// 对于已归档且 digest 有效的分区，直接合并 digest 结论，
+    /// 跳过 `query_by_hour_key` + `ingest` 的逐条解析。
+    pub fn merge_digest(&mut self, digest: &tp_protocol::digest::ArchiveDigest) {
+        // KPI
+        self.state.total_tokens.accumulate(&digest.total_tokens);
+        self.state.total_cost += digest.total_cost;
+        self.state.record_count += digest.record_count;
+
+        // 按来源
+        for (source, info) in &digest.by_source {
+            self.state.by_source.entry(*source).or_default().accumulate(info);
+        }
+        for (source, cost) in &digest.source_costs {
+            *self.state.source_costs.entry(*source).or_default() += cost;
+        }
+        for (source, count) in &digest.source_records {
+            *self.state.source_records.entry(*source).or_default() += count;
+        }
+
+        // 按模型
+        for (model, info) in &digest.by_model {
+            self.state.by_model.entry(model.clone()).or_default().accumulate(info);
+        }
+        for (model, cost) in &digest.model_costs {
+            *self.state.model_costs.entry(model.clone()).or_default() += cost;
+        }
+        for (model, count) in &digest.model_records {
+            *self.state.model_records.entry(model.clone()).or_default() += count;
+        }
+
+        // 按项目
+        for (project, info) in &digest.by_project {
+            self.state.by_project.entry(project.clone()).or_default().accumulate(info);
+        }
+        for (project, cost) in &digest.project_costs {
+            *self.state.project_costs.entry(project.clone()).or_default() += cost;
+        }
+        for (project, count) in &digest.project_records {
+            *self.state.project_records.entry(project.clone()).or_default() += count;
+        }
+        for (project, name) in &digest.project_names {
+            self.state.project_names.entry(project.clone()).or_insert_with(|| name.clone());
+        }
+
+        // 来源映射
+        for (project, sources) in &digest.project_sources {
+            self.state.project_sources.entry(project.clone()).or_default().extend(sources);
+        }
+        for (model, sources) in &digest.model_sources {
+            self.state.model_sources.entry(model.clone()).or_default().extend(sources);
+        }
+
+        // 按报告类型
+        for (rc, info) in &digest.by_report_class {
+            self.state.by_report_class.entry(*rc).or_default().accumulate(info);
+        }
+
+        // 时间序列 — by_day_stats
+        for (key, stats) in &digest.by_day_stats {
+            let entry = self.state.by_day_stats.entry(key.clone()).or_default();
+            entry.token_info.accumulate(&stats.token_info);
+            entry.record_count += stats.record_count;
+            entry.cost_usd += stats.cost_usd;
+            entry.message_count += stats.message_count;
+        }
+
+        // 时间序列 — by_day
+        for (key, stats) in &digest.by_day_stats {
+            self.state.by_day.entry(key.clone()).or_default().accumulate(&stats.token_info);
+        }
+
+        // 时间序列 — by_day_source
+        for (day_key, source_map) in &digest.by_day_source {
+            let self_map = self.state.by_day_source.entry(day_key.clone()).or_default();
+            for (source, stats) in source_map {
+                let entry = self_map.entry(*source).or_default();
+                entry.token_info.accumulate(&stats.token_info);
+                entry.record_count += stats.record_count;
+                entry.cost_usd += stats.cost_usd;
+                entry.message_count += stats.message_count;
+            }
+        }
+
+        // 时间序列 — by_month (从 time_key 推断)
+        let month_key = if digest.time_key.len() >= 7 {
+            digest.time_key[..7].to_string()
+        } else {
+            digest.time_key.clone()
+        };
+        self.state.by_month.entry(month_key).or_default().accumulate(&digest.total_tokens);
+
+        // 时间序列 — by_hour (仅 Daily digest 有)
+        if let Some(by_hour) = &digest.by_hour {
+            for (key, info) in by_hour {
+                self.state.by_hour.entry(key.clone()).or_default().accumulate(info);
+            }
+        }
+        if let Some(by_hour_source) = &digest.by_hour_source {
+            for (key, source_map) in by_hour_source {
+                let self_map = self.state.by_hour_source.entry(key.clone()).or_default();
+                for (source, info) in source_map {
+                    self_map.entry(*source).or_default().accumulate(info);
+                }
+            }
+        }
+
+        trace!(
+            time_key = %digest.time_key,
+            granularity = ?digest.granularity,
+            records = digest.record_count,
+            "merged digest into aggregator"
+        );
+    }
+
     /// 清空所有聚合状态
     pub fn reset(&mut self) {
         self.state = AggregationState::default();
+    }
+
+    /// 修剪过期小时级数据 — 移除 cutoff 之前的 `by_hour` 和 `by_hour_source` 条目
+    ///
+    /// 保留 `by_day`, `by_month`, `by_source`, `by_model` 等高层聚合不受影响。
+    /// 典型用法: `prune_hourly(48)` 保留最近 48 小时数据。
+    ///
+    /// 返回被移除的 key 数量。
+    pub fn prune_hourly(&mut self, retain_hours: u32) -> usize {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(retain_hours as i64);
+        let cutoff_key = cutoff.format("%Y-%m-%dT%H").to_string();
+
+        let before = self.state.by_hour.len();
+
+        self.state.by_hour.retain(|k, _| k.as_str() >= cutoff_key.as_str());
+        self.state.by_hour_source.retain(|k, _| k.as_str() >= cutoff_key.as_str());
+
+        let pruned = before.saturating_sub(self.state.by_hour.len());
+        if pruned > 0 {
+            tracing::debug!(
+                pruned,
+                remaining = self.state.by_hour.len(),
+                cutoff = %cutoff_key,
+                "hourly data pruned"
+            );
+        }
+        pruned
     }
 
     /// 从快照恢复聚合器
@@ -1050,5 +1194,50 @@ mod tests {
         let gpt_sources = snap.model_sources.get("gpt-4o").unwrap();
         assert!(gpt_sources.contains(&SourceName::Codex));
         assert!(!gpt_sources.contains(&SourceName::Antigravity));
+    }
+
+    #[test]
+    fn test_merge_digest() {
+        let dt = DateTime::from_timestamp_millis(1717000000000).unwrap();
+
+        // 1. 通过 raw ingest 构建基准
+        let mut raw_agg = IncrementalAggregator::new();
+        let logs = vec![
+            make_log(SourceName::Antigravity, "gemini-3.5-flash", "proj-a", dt, 100, 200),
+            make_log(SourceName::Codex, "gpt-4o", "proj-b", dt, 50, 75),
+        ];
+        raw_agg.ingest(&logs);
+        let raw_snap = raw_agg.snapshot();
+
+        // 2. 通过 digest + merge_digest 构建
+        let pricing = tp_protocol::PricingTable::builtin();
+        let digest = tp_protocol::digest::ArchiveDigest::build_daily(
+            "2024-05-30",
+            &logs,
+            |model, token| pricing.calculate_cost(model, token),
+        );
+
+        let mut digest_agg = IncrementalAggregator::new();
+        digest_agg.merge_digest(&digest);
+        let digest_snap = digest_agg.snapshot();
+
+        // 3. 验证核心指标一致
+        assert_eq!(raw_snap.total_tokens, digest_snap.total_tokens, "total_tokens");
+        assert_eq!(raw_snap.record_count, digest_snap.record_count, "record_count");
+        // 费用应近似 (浮点精度)
+        assert!((raw_snap.total_cost - digest_snap.total_cost).abs() < 0.001, "total_cost");
+
+        // 4. 验证维度数据一致
+        assert_eq!(raw_snap.by_source.len(), digest_snap.by_source.len(), "by_source count");
+        assert_eq!(raw_snap.by_model.len(), digest_snap.by_model.len(), "by_model count");
+        assert_eq!(raw_snap.by_project.len(), digest_snap.by_project.len(), "by_project count");
+
+        // 5. 验证 by_day_stats 被填充
+        assert!(!digest_snap.by_day_stats.is_empty(), "by_day_stats should be populated");
+        // date derived from timestamp 1717000000000 = 2024-05-29T16:26:40Z
+        assert!(digest_snap.by_day_stats.contains_key("2024-05-29"), "should have date key");
+
+        // 6. 验证 by_month 被填充
+        assert!(digest_snap.by_month.contains_key("2024-05"), "should have month key");
     }
 }

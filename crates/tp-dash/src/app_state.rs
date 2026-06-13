@@ -132,7 +132,10 @@ impl AppState {
     }
 
     pub fn with_view_rx(mut self, rx: tokio::sync::watch::Receiver<DashboardView>) -> Self {
+        let current = rx.borrow().clone();
+        self.view = current;
         self.view_rx = Some(rx);
+        precalculate(&mut self);
         self
     }
 
@@ -1134,6 +1137,10 @@ pub fn app_logic(state: &mut AppState) -> impl WidgetView<AppState> + use<> {
             move |proxy, mut rx_worker: tokio::sync::mpsc::UnboundedReceiver<WorkerMessage>| {
                 let mut rx_view = rx_opt.clone();
                 async move {
+                    if let Some(ref rx) = rx_view {
+                        let view = rx.borrow().clone();
+                        let _ = proxy.message(AppEvent::ViewUpdate(view));
+                    }
                     loop {
                         tokio::select! {
                             view_changed = async {

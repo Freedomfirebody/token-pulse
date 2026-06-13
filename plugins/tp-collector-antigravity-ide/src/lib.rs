@@ -188,6 +188,10 @@ impl DatasourceProvider for AntigravityIdeCollector {
     async fn health_check(&self) -> Result<bool, CollectionError> {
         Ok(self.session_root.join("brain").exists())
     }
+
+    fn data_notifier(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        Some(self.store.lock().append_notifier())
+    }
 }
 
 // ===== 共享辅助函数 =====
@@ -329,20 +333,37 @@ fn scan_brain_sessions(session_root: &Path) -> Vec<(String, u64)> {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.len() >= 32 && name.contains('-') {
-                    let mut mtime = 0;
-                    if let Ok(metadata) = entry.metadata() {
-                        if let Ok(modified) = metadata.modified() {
-                            if let Ok(duration) = modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-                                mtime = duration.as_millis() as u64;
-                            }
-                        }
-                    }
+                    // BUG FIX: 使用 transcript.jsonl 的文件 mtime 作为变更检测依据
+                    // 目录 mtime 不会因深层嵌套文件写入而更新
+                    let transcript_path = brain_dir
+                        .join(&name)
+                        .join(".system_generated")
+                        .join("logs")
+                        .join("transcript.jsonl");
+
+                    let mtime = file_mtime_ms(&transcript_path)
+                        .or_else(|| {
+                            entry.metadata().ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as u64)
+                        })
+                        .unwrap_or(0);
+
                     sessions.push((name, mtime));
                 }
             }
         }
     }
     sessions
+}
+
+/// 获取文件的修改时间（毫秒级 Unix 时间戳）
+fn file_mtime_ms(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
 }
 
 /// 计算本地 transcript.jsonl 的行数作为实际步数
@@ -380,25 +401,48 @@ fn find_parent_session_id_in_transcript(path: &Path, exclude_session_id: &str) -
 
 /// 在文本中查找第一个符合 UUID 格式的 36 字符子串，且其前面包含 conversation/orchestrator/parent 关键字
 fn find_uuid_in_text(text: &str, exclude: &str) -> Option<String> {
-    let text_lower = text.to_lowercase();
     let keywords = ["conversation id", "conversationid", "conversation", "orchestrator", "parent"];
     
+    let text_lower = text.to_lowercase();
+    
     for kw in &keywords {
-        let mut start_idx = 0;
-        while let Some(pos) = text_lower[start_idx..].find(kw) {
-            let abs_pos = start_idx + pos;
-            let search_start = abs_pos + kw.len();
-            let search_end = std::cmp::min(text.len(), search_start + 150);
+        let mut search_from = 0;
+        while search_from < text_lower.len() {
+            let Some(pos) = text_lower[search_from..].find(kw) else { break };
+            let abs_pos = search_from + pos;
+            let kw_end = abs_pos + kw.len();
+            
+            let search_start = snap_to_char_boundary(text, kw_end, true);
+            let raw_end = std::cmp::min(text.len(), search_start + 150);
+            let search_end = snap_to_char_boundary(text, raw_end, false);
+            
             if search_start < search_end {
                 let chunk = &text[search_start..search_end];
                 if let Some(uuid) = extract_uuid_with_exclude(chunk, exclude) {
                     return Some(uuid);
                 }
             }
-            start_idx = abs_pos + kw.len();
+            search_from = kw_end;
         }
     }
     None
+}
+
+/// 将字节索引调整到最近的 UTF-8 字符边界
+fn snap_to_char_boundary(s: &str, byte_idx: usize, forward: bool) -> usize {
+    if byte_idx >= s.len() { return s.len(); }
+    if byte_idx == 0 { return 0; }
+    if s.is_char_boundary(byte_idx) { return byte_idx; }
+    
+    if forward {
+        let mut i = byte_idx;
+        while i < s.len() && !s.is_char_boundary(i) { i += 1; }
+        i
+    } else {
+        let mut i = byte_idx;
+        while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+        i
+    }
 }
 
 fn extract_uuid_with_exclude(s: &str, exclude: &str) -> Option<String> {

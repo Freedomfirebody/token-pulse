@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use tp_protocol::{Datalog, PoolError};
+use tp_protocol::digest::ArchiveDigest;
 
 use crate::active;
 
@@ -117,6 +118,43 @@ impl ArchiveStore {
             to
         );
         Ok(all_logs)
+    }
+
+    // ─── Digest I/O ───
+
+    /// 写入日归档 Digest — 预计算的聚合结论
+    ///
+    /// 路径: `archive/daily/YYYY-MM-DD.digest.json`
+    pub fn write_daily_digest(&self, date_key: &str, digest: &ArchiveDigest) -> Result<PathBuf, PoolError> {
+        let path = self.daily_digest_path(date_key);
+        digest.save(&path).map_err(|e| {
+            PoolError::SerializationError(format!("Digest 写入失败 {}: {e}", path.display()))
+        })?;
+        tracing::debug!(
+            "日归档 Digest 已写入: {} -> {}",
+            date_key,
+            path.display()
+        );
+        Ok(path)
+    }
+
+    /// 读取日归档 Digest
+    pub fn read_daily_digest(&self, date_key: &str) -> Result<Option<ArchiveDigest>, PoolError> {
+        let path = self.daily_digest_path(date_key);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let digest = ArchiveDigest::load(&path).map_err(|e| {
+            PoolError::SerializationError(format!("Digest 读取失败 {}: {e}", path.display()))
+        })?;
+        Ok(Some(digest))
+    }
+
+    /// Digest 文件路径: `archive/daily/YYYY-MM-DD.digest.json`
+    pub fn daily_digest_path(&self, date_key: &str) -> PathBuf {
+        self.base_path
+            .join("daily")
+            .join(format!("{date_key}.digest.json"))
     }
 
     // ─── 内部辅助方法 ───

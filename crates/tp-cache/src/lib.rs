@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tracing::{debug, info, instrument, warn};
 
 use tp_compute::IncrementalAggregator;
@@ -115,6 +115,14 @@ impl DataCache {
             progress.last_build_at = Some(Utc::now());
         }
 
+        // 修剪过期小时级数据 — 保留最近 48 小时的 by_hour 明细
+        {
+            let pruned = self.aggregator.write().prune_hourly(48);
+            if pruned > 0 {
+                info!(pruned, "hourly data pruned after build");
+            }
+        }
+
         // 广播全量重建完成信号
         let _ = self.update_tx.send(CacheUpdateSignal::FullRebuildComplete);
 
@@ -165,8 +173,83 @@ impl DataCache {
 
         debug!(total_keys = total_count, "building from pool metadata");
 
-        // 2. 逐个 hour_key 读取数据并 ingest
+        // 收集 digest 可用的 date_key 集合（归档分区有有效 digest）
+        let mut digest_dates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut non_digest_keys: Vec<String> = Vec::new();
+
         for hour_key in &all_keys {
+            if let Some(idx) = metadata.indices.get(hour_key) {
+                if idx.has_valid_digest() {
+                    // 归档且有有效 digest — 按 date 分组
+                    let date_key = hour_key[..10].to_string();
+                    digest_dates.insert(date_key);
+                } else {
+                    non_digest_keys.push(hour_key.clone());
+                }
+            } else {
+                non_digest_keys.push(hour_key.clone());
+            }
+        }
+
+        debug!(
+            digest_dates = digest_dates.len(),
+            non_digest = non_digest_keys.len(),
+            "build: digest fast-path分析完成"
+        );
+
+        // 2a. Digest 快路径 — 按 date 加载预计算快照块
+        for date_key in &digest_dates {
+            // 尝试从 metadata 中找到该 date 任意一个 hour_key 的 digest_path
+            let digest_path = all_keys.iter()
+                .filter(|k| k.starts_with(date_key.as_str()))
+                .find_map(|k| {
+                    metadata.indices.get(k)
+                        .and_then(|idx| idx.digest_path.as_ref())
+                });
+
+            if let Some(path) = digest_path {
+                match tp_protocol::digest::ArchiveDigest::load(path) {
+                    Ok(digest) => {
+                        self.aggregator.write().merge_digest(&digest);
+
+                        // 标记该 date 下所有 hour_key 为已处理
+                        let mut processed = self.processed_keys.write();
+                        for k in all_keys.iter().filter(|k| k.starts_with(date_key.as_str())) {
+                            processed.insert(k.clone());
+                        }
+
+                        let date_key_count = all_keys.iter()
+                            .filter(|k| k.starts_with(date_key.as_str()))
+                            .count();
+                        let mut progress = self.progress.write();
+                        progress.processed_count += date_key_count;
+
+                        debug!(date_key, keys = date_key_count, "digest merged (fast-path)");
+                        continue;
+                    }
+                    Err(e) => {
+                        // Digest 加载失败 — 降级为逐条模式
+                        warn!(date_key, error = %e, "digest load failed, falling back to raw records");
+                        for k in all_keys.iter().filter(|k| k.starts_with(date_key.as_str())) {
+                            non_digest_keys.push(k.clone());
+                        }
+                    }
+                }
+            } else {
+                // 没找到 digest path — 降级
+                for k in all_keys.iter().filter(|k| k.starts_with(date_key.as_str())) {
+                    non_digest_keys.push(k.clone());
+                }
+            }
+        }
+
+        // 2b. 逐个 hour_key 读取数据并 ingest (无 digest 的分区)
+        for hour_key in &non_digest_keys {
+            // 跳过已通过 digest 处理的 key
+            if self.processed_keys.read().contains(hour_key) {
+                continue;
+            }
+
             // 检查 metadata 版本是否变化 (Rule 3)
             let current_version = self
                 .pool
@@ -233,11 +316,12 @@ impl DataCache {
         Ok(true)
     }
 
-    /// 增量更新 — 仅重新计算受影响的 hour_key 数据。
+    /// 增量更新 — 仅读取并累加受影响的 hour_key 数据。
     ///
-    /// 对应 Rule 4: 索引更新 → 重新计算受影响的索引数据。
-    /// 当前实现为"全量重建"策略（因增量差分需要反向减法支持），
-    /// 但只处理受影响的 key 以减少 I/O。
+    /// 对应 Rule 4: 新数据到达 → 只 ingest 新增的 hour_key 记录。
+    /// 这对 `DataPushed` 通知是安全的，因为推送的数据尚未被 aggregator 处理。
+    ///
+    /// 对于 `MetadataChanged`（归档等结构性变更），调用方应使用 `build()` 全量重建。
     #[instrument(skip(self), fields(affected_count = affected_keys.len()))]
     pub async fn incremental_update(&self, affected_keys: &[String]) -> Result<(), CacheError> {
         if affected_keys.is_empty() {
@@ -246,13 +330,49 @@ impl DataCache {
 
         info!(
             affected_keys = ?affected_keys,
-            "starting incremental update"
+            "starting true incremental update"
         );
 
-        // 增量更新策略: 重建整个聚合器 (简单可靠)
-        // 因为 IncrementalAggregator 只支持累加，不支持减法修正，
-        // 我们需要完整重建来保证数据正确性。
-        self.build().await?;
+        let mut ingested_count = 0usize;
+
+        for hour_key in affected_keys {
+            // 读取该 hour_key 的全部数据
+            let logs = self
+                .pool
+                .query_by_hour_key(hour_key)
+                .await
+                .map_err(|e| {
+                    CacheError::PoolCommunicationError(format!(
+                        "incremental query_by_hour_key({hour_key}) failed: {e}"
+                    ))
+                })?;
+
+            if !logs.is_empty() {
+                // 重建该 key 的策略:
+                // 如果该 key 已被处理过，需要全量重建以避免重复计数
+                if self.processed_keys.read().contains(hour_key) {
+                    debug!(hour_key, "key already processed, triggering full rebuild");
+                    self.build().await?;
+                    // 广播增量更新完成信号
+                    let _ = self
+                        .update_tx
+                        .send(CacheUpdateSignal::IncrementalUpdateComplete {
+                            affected_keys: affected_keys.to_vec(),
+                        });
+                    return Ok(());
+                }
+
+                self.aggregator.write().ingest(&logs);
+                self.processed_keys.write().insert(hour_key.clone());
+                ingested_count += logs.len();
+            }
+        }
+
+        info!(
+            ingested = ingested_count,
+            keys = affected_keys.len(),
+            "incremental update complete"
+        );
 
         // 广播增量更新完成信号
         let _ = self
@@ -307,6 +427,68 @@ impl DataCache {
         }
     }
 
+    /// 启动自治订阅 — 后台任务自动接收 Pool broadcast 并处理通知。
+    ///
+    /// 调用此方法后，Cache 不再需要 main.rs 手动调用 `on_pool_notification()`。
+    /// Pool 内部的 `push_datalogs()` 完成时自动 broadcast，
+    /// 此任务自动接收并处理通知。
+    pub fn start_auto_subscribe(
+        self: &Arc<Self>,
+        pool: Arc<dyn PoolStorage>,
+        shutdown: watch::Receiver<bool>,
+    ) {
+        let cache = Arc::clone(self);
+        let mut shutdown = shutdown;
+
+        tokio::spawn(async move {
+            let mut rx = match pool.subscribe().await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!("Cache 无法订阅 Pool broadcast: {e}，将依赖手动通知");
+                    return;
+                }
+            };
+
+            info!("Cache 自治订阅 Pool broadcast 已启动");
+
+            loop {
+                tokio::select! {
+                    notification = rx.recv() => {
+                        match notification {
+                            Ok(n) => {
+                                tracing::debug!(?n, "Cache 收到 Pool 通知");
+                                cache.on_pool_notification(n).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(lagged = n, "Cache 丢失 Pool 通知，触发全量重建");
+                                if let Err(e) = cache.build().await {
+                                    warn!(error = %e, "Cache 全量重建失败");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                info!("Pool broadcast 通道关闭，Cache 自治订阅退出");
+                                break;
+                            }
+                        }
+                    }
+                    res = shutdown.changed() => {
+                        match res {
+                            Ok(()) if *shutdown.borrow() => {
+                                info!("Cache 自治订阅收到退出信号");
+                                break;
+                            }
+                            Ok(()) => continue,
+                            Err(_) => {
+                                warn!("Cache shutdown channel 关闭");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// 订阅缓存更新信号。
     pub fn subscribe(&self) -> broadcast::Receiver<CacheUpdateSignal> {
         self.update_tx.subscribe()
@@ -318,6 +500,24 @@ impl DataCache {
         let snap = agg.snapshot();
         let now = Utc::now();
 
+        // 计算时间窗口费用 — 从 by_day_stats 中按日期范围求和
+        let today_key = now.format("%Y-%m-%d").to_string();
+        let today_cost = snap.by_day_stats.get(&today_key)
+            .map(|s| s.cost_usd)
+            .unwrap_or(0.0);
+
+        let week_start = (now - chrono::Duration::days(now.weekday().num_days_from_monday() as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        let week_cost: f64 = snap.by_day_stats.range(week_start..)
+            .map(|(_, s)| s.cost_usd)
+            .sum();
+
+        let month_start = format!("{}-01", now.format("%Y-%m"));
+        let month_cost: f64 = snap.by_day_stats.range(month_start..)
+            .map(|(_, s)| s.cost_usd)
+            .sum();
+
         DashboardView {
             // KPI 指标
             total_tokens: agg.window(TimeWindow::All, now),
@@ -325,9 +525,9 @@ impl DataCache {
             week_tokens: agg.window(TimeWindow::ThisWeek, now),
             month_tokens: agg.window(TimeWindow::ThisMonth, now),
             total_cost: snap.total_cost,
-            today_cost: 0.0,  // 精确的日费用需要逐条记录，此处暂用 0
-            week_cost: 0.0,   // 同上
-            month_cost: 0.0,  // 同上
+            today_cost,
+            week_cost,
+            month_cost,
             record_count: snap.record_count,
 
             // 分维度聚合

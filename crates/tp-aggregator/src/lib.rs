@@ -375,16 +375,12 @@ impl DataShow {
         self.run_full_loop(cache_rx, shutdown).await;
     }
 
-    /// 完整循环：cache 信号 + 定时器 + shutdown
+    /// 完整循环：cache 信号 + shutdown（纯响应式，无定时器兜底）
     async fn run_full_loop(
         self: &Arc<Self>,
         mut cache_rx: tokio::sync::broadcast::Receiver<tp_protocol::CacheUpdateSignal>,
         mut shutdown: watch::Receiver<bool>,
     ) {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        // Don't burst on startup — skip the first immediate tick
-        interval.tick().await;
-
         loop {
             tokio::select! {
                 // Shutdown signal
@@ -402,7 +398,7 @@ impl DataShow {
                     }
                 }
 
-                // Cache update signal
+                // Cache update signal — 纯响应式刷新
                 signal = cache_rx.recv() => {
                     match signal {
                         Ok(sig) => {
@@ -421,14 +417,6 @@ impl DataShow {
                             warn!("DataShow: cache broadcast channel closed, switching to timer-only");
                             break;
                         }
-                    }
-                }
-
-                // Periodic refresh every 30 seconds
-                _ = interval.tick() => {
-                    debug!("DataShow: periodic refresh");
-                    if let Err(e) = self.refresh().await {
-                        error!("DataShow periodic refresh failed: {e}");
                     }
                 }
             }

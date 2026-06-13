@@ -37,6 +37,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn, error};
 
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
+
 use tp_protocol::{DataShowProvider, PoolStorage};
 use anyhow::Result;
 
@@ -144,6 +147,11 @@ fn main() -> Result<()> {
     let proxy_clone = proxy.clone();
     let mut view_rx_clone = view_rx.clone();
     runtime.spawn(async move {
+        // Send initial update event to ensure initial view is rendered
+        let action: ErasedAction = Box::new(TelemetryUpdateEvent);
+        let user_event = MasonryUserEvent::Action(main_window_id, action, WidgetId::reserved(0));
+        let _ = proxy_clone.send_event(user_event);
+
         while view_rx_clone.changed().await.is_ok() {
             let action: ErasedAction = Box::new(TelemetryUpdateEvent);
             let user_event = MasonryUserEvent::Action(main_window_id, action, WidgetId::reserved(0));
@@ -174,6 +182,7 @@ fn main() -> Result<()> {
         floating_resources: None,
         tooltip_window: None,
         resize_animation: None,
+        float_needs_redraw: true,
     };
 
     info!("UI 事件循环开启");
@@ -225,6 +234,13 @@ async fn run_pipeline(
     if let Err(e) = cache.build().await {
         warn!(error = %e, "缓存首次构建失败，将使用空数据");
     }
+
+    // 启动 Cache 自治订阅 — 自动接收 Pool broadcast，无需 main.rs 手动中转
+    cache.start_auto_subscribe(
+        pool.clone() as Arc<dyn PoolStorage>,
+        shutdown_rx.clone(),
+    );
+
     info!("Data Cache 就绪");
 
     // ===== 初始化 Aggregator (Data Show) =====
@@ -289,7 +305,6 @@ async fn run_pipeline(
     // ===== 数据摄入管道: collect_rx → pool =====
     let mut shutdown_rx_ingest = shutdown_rx.clone();
     let pool_for_ingest = pool.clone();
-    let cache_for_ingest = cache.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -303,7 +318,6 @@ async fn run_pipeline(
                     match opt {
                         Some(logs) => {
                             if logs.is_empty() { continue; }
-                            let count = logs.len();
                             match pool_for_ingest.push_datalogs(logs).await {
                                 Ok(result) => {
                                     info!(
@@ -312,14 +326,8 @@ async fn run_pipeline(
                                         skipped = result.skipped,
                                         "数据已推送到 Pool"
                                     );
-                                    // 通知缓存
-                                    if !result.affected_hour_keys.is_empty() {
-                                        let notification = tp_protocol::PoolNotification::DataPushed {
-                                            affected_hour_keys: result.affected_hour_keys,
-                                            record_count: count,
-                                        };
-                                        cache_for_ingest.on_pool_notification(notification).await;
-                                    }
+                                    // Cache 已通过 start_auto_subscribe 自动接收 Pool broadcast，
+                                    // 无需手动调用 cache.on_pool_notification()
                                 }
                                 Err(e) => {
                                     error!(error = %e, "推送数据到 Pool 失败");
@@ -448,15 +456,22 @@ async fn run_pipeline(
 
     info!("数据管道启动完成");
 
-    // 主管道任务: 定期将 aggregator view 推送到 UI，支持优雅退出
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    let view_subscriber = aggregator.subscribe_view();
+    // 主管道任务: 响应式将 aggregator view 推送到 UI，支持优雅退出
+    let mut view_subscriber = aggregator.subscribe_view();
+    let mut warning_rx_loop = warning_rx.clone();
     let mut shutdown_rx_loop = shutdown_rx.clone();
     loop {
         tokio::select! {
-            _ = interval.tick() => {
+            // Aggregator view 变更 — 立即推送
+            _ = view_subscriber.changed() => {
+                let mut current_view = view_subscriber.borrow_and_update().clone();
+                current_view.memory_warning = warning_rx_loop.borrow().clone();
+                let _ = view_tx.send(current_view);
+            }
+            // Memory warning 变更 — 混入最新 view 并推送
+            _ = warning_rx_loop.changed() => {
                 let mut current_view = view_subscriber.borrow().clone();
-                current_view.memory_warning = warning_rx.borrow().clone();
+                current_view.memory_warning = warning_rx_loop.borrow_and_update().clone();
                 let _ = view_tx.send(current_view);
             }
             res = shutdown_rx_loop.changed() => {
@@ -826,6 +841,7 @@ struct ExternalApp {
     floating_resources: Option<FloatingWindowResources>,
     tooltip_window: Option<winit::window::Window>,
     resize_animation: Option<ResizeAnimation>,
+    float_needs_redraw: bool,
 }
 
 fn get_snapped_layout(state: WidgetState, w: &winit::window::Window) -> Option<(winit::dpi::PhysicalPosition<i32>, winit::dpi::LogicalSize<f64>)> {
@@ -959,6 +975,8 @@ impl ExternalApp {
             .with_inner_size(winit::dpi::LogicalSize::new(logical_w, logical_h))
             .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
             .with_visible(false);
+        #[cfg(target_os = "windows")]
+        let tooltip_attrs = tooltip_attrs.with_skip_taskbar(true);
 
         let tooltip = match event_loop.create_window(tooltip_attrs) {
             Ok(w) => w,
@@ -1093,10 +1111,11 @@ impl ExternalApp {
         }
     }
 
-    fn step_resize_animation(&mut self) {
+    fn step_resize_animation(&mut self) -> bool {
         let mut finished = false;
         let mut next_pos = None;
         let mut next_size = None;
+        let was_active = self.resize_animation.is_some();
 
         if let Some(ref anim) = self.resize_animation {
             let elapsed = anim.start_time.elapsed();
@@ -1133,6 +1152,8 @@ impl ExternalApp {
         if finished {
             self.resize_animation = None;
         }
+
+        was_active
     }
 
     fn toggle_floating_window(&mut self, event_loop: &ActiveEventLoop) {
@@ -1154,6 +1175,8 @@ impl ExternalApp {
                 .with_inner_size(winit::dpi::LogicalSize::new(64.0, 64.0))
                 .with_position(initial_pos)
                 .with_visible(true);
+            #[cfg(target_os = "windows")]
+            let attrs = attrs.with_skip_taskbar(true);
             match event_loop.create_window(attrs) {
                 Ok(w) => {
                     self.floating_window = Some(w);
@@ -1785,16 +1808,18 @@ impl ApplicationHandler<MasonryUserEvent> for ExternalApp {
                 }
             }
             
-            self.step_resize_animation();
+            let animation_active = self.step_resize_animation();
             
-            if let Some(ref w) = self.floating_window {
-                w.request_redraw();
+            // 仅在动画进行中或内容变化时请求重绘，避免无限帧率渲染
+            if animation_active || self.float_needs_redraw {
+                self.float_needs_redraw = false;
+                if let Some(ref w) = self.floating_window {
+                    w.request_redraw();
+                }
             }
         }
 
-        if let Some(ref tooltip) = self.tooltip_window {
-            tooltip.request_redraw();
-        }
+        // tooltip 不需要每帧重绘 — 内容仅在 show 时绘制一次
 
         self.masonry_state.handle_about_to_wait(event_loop);
     }

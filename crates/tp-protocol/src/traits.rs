@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 
 use crate::datalog::{Datalog, SourceName};
 use crate::dimension::Dimension;
@@ -17,6 +18,11 @@ use crate::view::DashboardView;
 ///
 /// 每个采集组件 (antigravity / codex / claude) 实现此 trait。
 /// datasource 只采集结束的数据。
+///
+/// 支持两种数据获取模式：
+/// - **拉取（默认）**: 定时调用 `collect()` / `collect_since()`
+/// - **推送（可选）**: 实现 `data_notifier()` 返回 `Some(Notify)`，
+///   框架会在 `select!` 中监听通知并立即触发 `collect()`
 #[async_trait]
 pub trait DatasourceProvider: Send + Sync {
     /// 获取此数据源的名称标识
@@ -33,6 +39,17 @@ pub trait DatasourceProvider: Send + Sync {
 
     /// 检查数据源是否可用
     async fn health_check(&self) -> Result<bool, CollectionError>;
+
+    /// 获取数据到达通知器（可选）
+    ///
+    /// 如果数据源内部有 IngestStore 等缓冲区，
+    /// 可返回 `Some(notify)` 让框架在新数据到达时立即触发 `collect()`，
+    /// 而非等到下一个定时器周期。
+    ///
+    /// 默认返回 `None`，表示仅使用定时拉取模式。
+    fn data_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 // ===== 数据池存储 Trait =====
